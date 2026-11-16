@@ -1,0 +1,41 @@
+server:
+  address: 127.0.0.1
+  port: 8083
+
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_ISSUER:http://localhost:8090/realms/seatlock}
+          audiences:
+            - booking-api
+  application:
+    name: booking-service
+  datasource:
+    url: ${BOOKING_DB_URL:jdbc:postgresql://localhost:5433/booking_db}
+    username: ${BOOKING_DB_USERNAME:booking_user}
+    password: ${BOOKING_DB_PASSWORD}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+
+inventory:
+  base-url: ${INVENTORY_BASE_URL:http://localhost:8082}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+
+# Part 5 machine-to-machine authentication; secret must be provided locally.
+security:
+  machine:
+    token-uri: ${KEYCLOAK_TOKEN_URI:http://localhost:8090/realms/seatlock/protocol/openid-connect/token}
+    client-id: seatlock-booking-service
+    client-secret: ${BOOKING_MACHINE_SECRET}

@@ -1,0 +1,71 @@
+server:
+  address: 127.0.0.1
+  port: 8080
+
+spring:
+  application:
+    name: gateway-service
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_ISSUER:http://localhost:8090/realms/seatlock}
+          audiences:
+            - booking-api
+  cloud:
+    gateway:
+      server:
+        webflux:
+          httpclient:
+            connect-timeout: 2000
+            response-timeout: 5s
+          globalcors:
+            add-to-simple-url-handler-mapping: true
+            cors-configurations:
+              '[/**]':
+                allowedOrigins:
+                  - http://localhost:5173
+                  - http://127.0.0.1:5173
+                allowedMethods:
+                  - GET
+                  - POST
+                  - OPTIONS
+                allowedHeaders:
+                  - Authorization
+                  - Content-Type
+                  - Idempotency-Key
+                  - X-Request-ID
+                exposedHeaders:
+                  - X-Request-ID
+                  - Location
+                allowCredentials: false
+                maxAge: 3600
+          routes:
+            - id: inventory-public-reads
+              uri: ${INVENTORY_URI:http://127.0.0.1:8082}
+              predicates:
+                - Path=/api/v1/events,/api/v1/events/*/seats
+                - Method=GET
+              filters:
+                # Public Inventory API doesn't need customer JWT (aud=booking-api).
+                # Forwarding it would fail Inventory's aud=inventory-api validation.
+                - RemoveRequestHeader=Authorization
+                - RemoveRequestHeader=Cookie
+                - RemoveRequestHeader=X-Demo-User
+            - id: booking-customer-api
+              uri: ${BOOKING_URI:http://127.0.0.1:8083}
+              predicates:
+                - Path=/api/v1/bookings,/api/v1/bookings/*,/api/v1/bookings/*/retry
+                - Method=GET,POST
+              filters:
+                - RemoveRequestHeader=Cookie
+                - RemoveRequestHeader=X-Demo-User
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  health:
+    redis:
+      enabled: false

@@ -1,0 +1,5 @@
+com/seatlock/gateway/GatewayApplication.class
+com/seatlock/gateway/security/RealmRolesConverter.class
+com/seatlock/gateway/security/GatewaySecurityConfig.class
+com/seatlock/gateway/config/RateLimitConfig.class
+com/seatlock/gateway/filters/RequestIdWebFilter.class

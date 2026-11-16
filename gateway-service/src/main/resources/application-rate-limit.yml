@@ -1,0 +1,40 @@
+# Optional profile only: Spring Cloud Gateway RequestRateLimiter backed by Redis.
+# Activate with SPRING_PROFILES_ACTIVE=rate-limit AFTER starting Redis.
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+  cloud:
+    gateway:
+      server:
+        webflux:
+          routes:
+            - id: inventory-public-reads
+              uri: ${INVENTORY_URI:http://127.0.0.1:8082}
+              predicates:
+                - Path=/api/v1/events,/api/v1/events/*/seats
+                - Method=GET
+              filters:
+                - RemoveRequestHeader=Authorization
+                - RemoveRequestHeader=Cookie
+                - RemoveRequestHeader=X-Demo-User
+            - id: booking-customer-api
+              uri: ${BOOKING_URI:http://127.0.0.1:8083}
+              predicates:
+                - Path=/api/v1/bookings,/api/v1/bookings/*,/api/v1/bookings/*/retry
+                - Method=GET,POST
+              filters:
+                - RemoveRequestHeader=Cookie
+                - RemoveRequestHeader=X-Demo-User
+                - name: RequestRateLimiter
+                  args:
+                    key-resolver: "#{@customerSubjectKeyResolver}"
+                    redis-rate-limiter.replenishRate: 15
+                    redis-rate-limiter.burstCapacity: 30
+                    redis-rate-limiter.requestedTokens: 1
+
+management:
+  health:
+    redis:
+      enabled: true

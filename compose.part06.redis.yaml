@@ -1,0 +1,8 @@
+# Optional Compose overlay. Does NOT overwrite your existing compose.yaml.
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    restart: unless-stopped

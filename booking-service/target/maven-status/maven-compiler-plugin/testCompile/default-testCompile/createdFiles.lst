@@ -1,0 +1,3 @@
+com/seatlock/booking/integration/BookingPersistenceTest.class
+com/seatlock/booking/application/BookingWorkflowTest.class
+com/seatlock/booking/security/RealmRolesConverterTest.class
