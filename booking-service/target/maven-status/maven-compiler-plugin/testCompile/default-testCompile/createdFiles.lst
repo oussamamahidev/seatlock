@@ -1,3 +1,6 @@
+com/seatlock/booking/application/BookingRecoveryWorkerTest.class
+com/seatlock/booking/application/RetryBackoffTest.class
 com/seatlock/booking/integration/BookingPersistenceTest.class
+com/seatlock/booking/integration/BookingRecoveryJobIntegrationTest.class
 com/seatlock/booking/application/BookingWorkflowTest.class
 com/seatlock/booking/security/RealmRolesConverterTest.class

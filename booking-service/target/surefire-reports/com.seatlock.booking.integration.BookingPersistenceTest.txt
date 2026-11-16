@@ -1,4 +1,4 @@
 -------------------------------------------------------------------------------
 Test set: com.seatlock.booking.integration.BookingPersistenceTest
 -------------------------------------------------------------------------------
-Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 5.925 s -- in com.seatlock.booking.integration.BookingPersistenceTest
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 6.230 s -- in com.seatlock.booking.integration.BookingPersistenceTest

@@ -19,7 +19,7 @@ public class BookingSecurityConfig {
             .csrf(AbstractHttpConfigurer::disable) // Stateless bearer API; never cookie-session auth here.
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(auth -> auth
-                .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
+                .requestMatchers("/actuator/health", "/actuator/health/**", "/actuator/prometheus").permitAll()
                 .requestMatchers(HttpMethod.POST, "/api/v1/bookings", "/api/v1/bookings/*/retry")
                     .hasAuthority("ROLE_customer")
                 .requestMatchers(HttpMethod.GET, "/api/v1/bookings/*")

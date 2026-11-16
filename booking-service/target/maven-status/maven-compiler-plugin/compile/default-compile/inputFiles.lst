@@ -4,10 +4,14 @@
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/api/BookingView.java
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/api/CreateBookingRequest.java
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/application/BookingNotFoundException.java
+/home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/application/BookingRecoveryWorker.java
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/application/BookingStore.java
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/application/BookingWorkflow.java
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/application/IdempotencyMismatchException.java
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/application/InventoryPort.java
+/home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/application/RecoveryJobStore.java
+/home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/application/RecoveryLease.java
+/home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/application/RetryBackoff.java
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/domain/BookingEntity.java
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/domain/BookingStatus.java
 /home/oussama/Desktop/seatlock/booking-service/src/main/java/com/seatlock/booking/infrastructure/MachineTokenProvider.java

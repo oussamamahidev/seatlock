@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @Testcontainers
-@SpringBootTest(properties = "security.machine.client-secret=unused-in-persistence-test")
+@SpringBootTest(properties = {"seatlock.recovery.enabled=false", "security.machine.client-secret=test-secret"})
 class BookingPersistenceTest {
     @Container
     static PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:17-alpine")
