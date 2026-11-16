@@ -1,3 +1,4 @@
 /home/oussama/Desktop/seatlock/inventory-service/src/test/java/com/seatlock/inventory/application/SeatReservationServiceTest.java
+/home/oussama/Desktop/seatlock/inventory-service/src/test/java/com/seatlock/inventory/integration/SeatHoldLifecycleIntegrationTest.java
 /home/oussama/Desktop/seatlock/inventory-service/src/test/java/com/seatlock/inventory/integration/SeatReservationConcurrencyTest.java
 /home/oussama/Desktop/seatlock/inventory-service/src/test/java/com/seatlock/inventory/security/RealmRolesConverterTest.java

@@ -20,7 +20,12 @@ public class BookingSecurityConfig {
             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers("/actuator/health", "/actuator/health/**", "/actuator/prometheus").permitAll()
-                .requestMatchers(HttpMethod.POST, "/api/v1/bookings", "/api/v1/bookings/*/retry")
+                .requestMatchers(HttpMethod.POST, "/api/v1/holds")
+                    .hasAuthority("ROLE_customer")
+                .requestMatchers(HttpMethod.DELETE, "/api/v1/holds/*")
+                    .hasAuthority("ROLE_customer")
+                .requestMatchers(HttpMethod.POST, "/api/v1/bookings", "/api/v1/bookings/*/retry",
+                        "/api/v1/bookings/*/cancel")
                     .hasAuthority("ROLE_customer")
                 .requestMatchers(HttpMethod.GET, "/api/v1/bookings/*")
                     .hasAuthority("ROLE_customer")

@@ -36,6 +36,14 @@ public class BookingController {
                 .body(outcome.booking());
     }
 
+    @PostMapping("/{id}/cancel")
+    public ResponseEntity<BookingView> cancel(
+            @AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
+        BookingView result = workflow.cancel(customerId(jwt), id);
+        return ResponseEntity.status(result.status() == BookingStatus.CANCELLED
+                        ? HttpStatus.OK : HttpStatus.ACCEPTED).body(result);
+    }
+
     @GetMapping("/{id}")
     public BookingView get(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
         return workflow.get(customerId(jwt), id);
@@ -57,7 +65,8 @@ public class BookingController {
         return switch (state) {
             case CONFIRMED -> newlyCreated ? HttpStatus.CREATED : HttpStatus.OK;
             case REJECTED -> HttpStatus.CONFLICT;
-            case PENDING, UNCERTAIN -> HttpStatus.ACCEPTED;
+            case CANCELLED -> HttpStatus.OK;
+            case PENDING, UNCERTAIN, CANCEL_PENDING -> HttpStatus.ACCEPTED;
         };
     }
 }

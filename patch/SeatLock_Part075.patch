@@ -1,0 +1,2574 @@
+diff --git a/README_PART075_PRODUCTION_HARDENING_DARIJA.md b/README_PART075_PRODUCTION_HARDENING_DARIJA.md
+new file mode 100644
+index 0000000..61216cc
+--- /dev/null
++++ b/README_PART075_PRODUCTION_HARDENING_DARIJA.md
+@@ -0,0 +1,301 @@
++# SeatLock — Part 7.5: Backend Production Hardening (Darija / clavier FR)
++
++**Statut:** source patch prepared; Java syntax / YAML / Python checks done. `mvn verify`, PostgreSQL/Testcontainers, Keycloak, Docker, real HTTP and k6 **must run on your Ubuntu**. This is NOT a claim of production readiness.
++
++## 0. Chno zedna? (b7al vrai backend engineer)
++
++Part 7 kan fiha Booking `PENDING → CONFIRMED | REJECTED | UNCERTAIN`, recovery job b PostgreSQL, OAuth2 machine identity, Gateway, Redis. Daba Part 7.5 katzid **business lifecycle + proof under concurrency**:
++
++- **Temporary seat hold**: `AVAILABLE → HELD`, expiry after 120s (configurable 10–600), cancel before booking. ACTIVE hold kayblocki bookings dyal ness okhrin.
++- **Confirm a held seat**: user kaycreate Booking m3a `holdId`, Booking kay3ayet Inventory b machine token w original customerId; only owner y9der yconfirmi hold li mazal valid.
++- **Permanent confirmed booking**: `HELD → RESERVED`; `RESERVED` ma 3ndhach TTL. Ila auto-expire CONFIRMED, ghadi ndiro loss of data/business consistency.
++- **Cancel confirmed booking (durable Saga)**: `CONFIRMED → CANCEL_PENDING → CANCELLED`. Worker kayrelease Inventory b original bookingId, kayretry ila service down, w kaymarki booking CANCELLED in Booking DB. Job kayt7fed f nafs ACID transaction m3a `CANCEL_PENDING`.
++- **Reservation tombstone**: f Inventory `seat_reservation_history(bookingId, seatId, state ACTIVE/CANCELLED)`. Ila response qdima / delayed retry jat mlli booking CANCELLED, history kayrefusi re-reserve. Hadchi critical.
++- **Concurrency / load test**: Testcontainers, HTTP burst, k6 script. Exactly one winner for same seat.
++- **Multi-instance**: 2 Booking JVMs (8083/8084) m3a Nginx (8085), Gateway (8080). Same PostgreSQL w same job queues b `FOR UPDATE SKIP LOCKED`.
++
++### Architecture
++
++```text
++Browser/Curl/React (customer access token)
++                 |
++         Gateway :8080 (JWT + routing + optional Redis rate limit)
++                 |
++      +----------+----------+
++      |                     |
++Booking A :8083        Booking B :8084     (Nginx 8085 in optional lab)
++      +----------+----------+
++                 |
++             booking_db
++         bookings, recovery_jobs,
++         cancellation_jobs
++                 |
++         client_credentials JWT
++                 |
++           Inventory :8082
++                 |
++             inventory_db
++       seats, hold_requests,
++       reservation_history
++```
++
++## 1. Sécurité w ACID — 3lach l design mzyan?
++
++**Atomicity:** Inventory `UPDATE seats` w `INSERT seat_hold_requests` f **nafs transaction**. Haka ma kaynch HELD bla recorded idempotency history. Booking `CANCEL_PENDING` w `INSERT booking_cancellation_jobs` f **nafs local transaction**. Inventory release dyal seat w marking reservation history CANCELLED f **nafs transaction**.
++
++**Consistency:** `ck_seats_lifecycle_state` kayفرض:
++
++```text
++AVAILABLE => reservation_id, hold_id, hold_customer_id, hold_expires_at = NULL
++HELD      => hold_id + customer_id + expires_at NOT NULL; reservation_id NULL
++RESERVED  => reservation_id NOT NULL; all hold fields NULL
++```
++
++**Isolation:** atomic `UPDATE ... WHERE status = ...` katdir row locking f PostgreSQL. Ila 20 users kaytnafso 3la seat, only one update ymatchi. `FOR UPDATE SKIP LOCKED` f cancellation jobs kaykhlli workers y9essmo rows bla same lease.
++
++**Durability:** booking state and jobs in PostgreSQL persist after process restart; a client HTTP timeout ma kaymhi-ch server-side state.
++
++**SOLID:** `HoldWorkflow` kay3ref business intent, `HoldPort` howa interface, `RestInventoryAdapter` HTTP implementation, `SeatHoldService` handles atomic inventory writes, `ReservationHistoryStore` stores idempotency tombstones, `BookingCancellationWorker` does only scheduled orchestration. Kamlou bhal dependency inversion / separation of concerns.
++
++**Mouhim:** ACID ma kaynch across `booking_db` + `inventory_db`. We use a *Saga-style durable compensation job* and eventual consistency. Chno ila Inventory releases seat walakin worker crashes qbel update Booking? Retry performs idempotent release, then marks CANCELLED. No distributed 2PC assumed.
++
++## 2. Install safely — ma temessch fix dyal Recovery Worker
++
++You recently fixed `BookingRecoveryWorker` with an AI CLI. L patch hna is computed **against Part 7 archive BEFORE your CLI changes**. Important! **Do not copy an old full-project ZIP over your live directory.** Use a unified patch; it should preserve unrelated CLI fixes. If conflict appears, DON'T force apply.
++
++```bash
++cd ~/Desktop/seatlock
++mkdir -p ~/Desktop/seatlock-backups
++cp -a booking-service ~/Desktop/seatlock-backups/booking-before-075
++cp -a inventory-service ~/Desktop/seatlock-backups/inventory-before-075
++cp -a gateway-service ~/Desktop/seatlock-backups/gateway-before-075
++
++# Extract deliverable ZIP into Downloads, then:
++git apply --check ~/Downloads/SeatLock_Part075.patch
++# ONLY if --check exits successfully:
++git apply ~/Downloads/SeatLock_Part075.patch
++```
++
++Alternative (ZIP bundle has an installer which runs the compatibility check, then backs up all three services before applying):
++
++```bash
++cd ~/Desktop/seatlock
++bash ~/Downloads/SeatLock-Part075-Patch/INSTALL_PART075.sh
++```
++
++**If `git apply --check` fails:** your CLI modified overlapping lines. Do NOT overwrite recovery code or apply with `--reject`; give the patch to your CLI agent and ask it to merge hunks carefully while preserving its previous fix. Migrations `V4/V5` Inventory and `V3/V4` Booking are ADDITIVE with historical row backfill; never run `flyway clean` or wipe databases.
++
++### DB migrations
++
++Inventory (after V3):
++- `V4__temporary_seat_holds.sql`: adds hold columns, updates both seat CHECK constraints, unique hold_id index, immutable `seat_hold_requests`.
++- `V5__reservation_history.sql`: creates permanent ACTIVE/CANCELLED history, **backfills existing RESERVED seats**.
++
++Booking (after V2):
++- `V3__booking_hold_reference.sql`: nullable `hold_id` reference on bookings. Old bookings unaffected.
++- `V4__cancellation_jobs.sql`: extends status CHECK + durable cancellation jobs.
++
++**Backup DB before migrations** in any environment with valuable data. All tests should first run against disposable/Testcontainers DBs.
++
++## 3. Start services
++
++You already have PostgreSQL + Keycloak from previous parts. Stop old Java processes FIRST and restart one-by-one. Inventory first, Booking second, Gateway third. Ports 8082/8083/8080 must not be occupied by OLD JVMs.
++
++```bash
++cd ~/Desktop/seatlock
++# Inventory terminal (DB_PASSWORD must be exported):
++cd inventory-service
++mvn clean verify
++mvn spring-boot:run -Dspring-boot.run.profiles=local
++
++# Booking terminal (BOOKING_DB_PASSWORD + BOOKING_MACHINE_SECRET exported):
++cd ~/Desktop/seatlock/booking-service
++mvn clean verify
++export RECOVERY_ENABLED=true
++mvn spring-boot:run
++
++# Gateway terminal
++cd ~/Desktop/seatlock/gateway-service
++mvn clean verify
++mvn spring-boot:run
++```
++
++**Start one command per terminal; `mvn spring-boot:run` blocks intentionally.**
++
++Verify:
++
++```bash
++for port in 8082 8083 8080; do
++  curl -fsS "http://localhost:$port/actuator/health" && echo
++ done
++```
++
++Optional verify Flyway history:
++
++```bash
++docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d inventory_db -c "SELECT installed_rank,version,success FROM flyway_schema_history ORDER BY installed_rank;"'
++docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d booking_db -c "SELECT installed_rank,version,success FROM flyway_schema_history ORDER BY installed_rank;"'
++```
++
++## 4. Seed new isolated TEST event (no deletions)
++
++You already booked many seats in the original demo event. Ma nresetiwch data. Had script katzid event jdid + 20 seats (additive only):
++
++```bash
++cd ~/Desktop/seatlock
++bash scripts/part075_seed_event.sh
++# Copy result exactly, e.g.:
++export SEATLOCK_EVENT_ID=PASTE_NEW_EVENT_UUID
++```
++
++Use same terminal export for next Python smoke commands. It uses authenticated CLI demo users. **Keycloak password grant in scripts is local test convenience only, not frontend production auth; frontend should use Authorization Code + PKCE.**
++
++## 5. Lab A — Holds, idempotency, owner checking
++
++```bash
++cd ~/Desktop/seatlock
++python3 scripts/part075_holds_smoke.py
++```
++
++Expected checks:
++- Alice creates a hold: 201 HELD, `expiresAt` present.
++- Same idempotency key same owner same seat: 200 same `holdId`.
++- Bob cannot redeem Alice's hold: 409.
++- Bob cannot bypass hold with ordinary booking: 409.
++- Alice confirms hold via Booking: 201 CONFIRMED.
++- Canceling active hold: 204, seat AVAILABLE.
++- After cancellation same old key cannot create another hold: 409 due to tombstone.
++
++Direct inventory hold/confirm endpoints are **machine-only**; don't route them publicly through Gateway.
++
++## 6. Lab B — Confirmed booking cancellation + compensation
++
++```bash
++python3 scripts/part075_cancel_smoke.py
++```
++
++Expected:
++- Alice books AVAILABLE seat → 201 CONFIRMED.
++- Bob tries to cancel Alice booking → 404 (ownership hiding).
++- Alice `POST /api/v1/bookings/{id}/cancel` → 202 CANCEL_PENDING.
++- Cancellation worker claims job; calls Inventory release with **original bookingId**.
++- Inventory `RESERVED → AVAILABLE`, `seat_reservation_history.ACTIVE → CANCELLED`, same transaction.
++- Booking `CANCEL_PENDING → CANCELLED`; cancellation job becomes DONE.
++- A late `/retry` of canceled booking must NOT reserve the seat again.
++- Bob can reserve released seat with new Booking ID.
++
++SQL verification (replace Booking UUID):
++
++```sql
++SELECT b.id,b.status,c.state,c.attempt_count,c.last_error
++FROM bookings b JOIN booking_cancellation_jobs c ON c.booking_id=b.id
++WHERE b.id='PUT_REAL_BOOKING_UUID';
++-- Expected: CANCELLED / DONE
++```
++
++**If Inventory is DOWN:** cancel returns 202, worker retries; job is persisted. Backoff is exponential with capped jitter. After max attempts job becomes `EXHAUSTED` and requires operator intervention; never claim unconditional eventual completion.
++
++## 7. Lab C — Race conditions, ACID correctness
++
++```bash
++python3 scripts/part075_concurrency.py --clients 20
++```
++
++Expected: on a fresh AVAILABLE seat, 1 request `201 CONFIRMED` and 19 requests `409` (with Gateway Redis rate-limit profile **OFF**). This does not measure max throughput; it tests the **invariant**. In Java tests, `SeatHoldLifecycleIntegrationTest` uses PostgreSQL Testcontainers, including 20 competing holds and cancellation tombstone.
++
++```bash
++cd ~/Desktop/seatlock/inventory-service
++mvn -Dtest=SeatHoldLifecycleIntegrationTest test
++mvn -Dtest=SeatReservationConcurrencyTest test
++```
++
++For k6 (optional installation):
++
++```bash
++# Use fresh seat UUID from GET /api/v1/events/{SEATLOCK_EVENT_ID}/seats
++# Set valid JWT access token in ACCESS_TOKEN; never commit it to Git.
++SEAT_ID=REAL_AVAILABLE_SEAT_UUID ACCESS_TOKEN=YOUR_ACCESS_TOKEN \
++  EVENT_ID="$SEATLOCK_EVENT_ID" VUS=20 \
++  k6 run load/booking-same-seat.js
++```
++
++**Warning:** the k6 JS script is a contention test, not a full benchmarking report. Watch total 201 vs 409, p95 latency, CPU, PostgreSQL connections and lock waits. Any 429 is Gateway rate limiting, not proof of seat correctness. Don't publish raw auth tokens.
++
++## 8. Lab D — Nginx load balancing m3a 2 Booking instances
++
++This is optional LOCAL LINUX development lab, **not** production HA. `compose.part075.loadbalancer.yaml` uses `network_mode: host` because Boot services bind `127.0.0.1`, and Nginx listens on host `127.0.0.1:8085`.
++
++- Terminal A: existing Booking `8083` with DB credentials + machine secret.
++- Terminal B: second Booking JVM with same DB and secret, different port:
++
++```bash
++cd ~/Desktop/seatlock/booking-service
++export BOOKING_DB_PASSWORD='YOUR_LOCAL_DB_PASSWORD'
++export BOOKING_MACHINE_SECRET='YOUR_LOCAL_KEYCLOAK_MACHINE_SECRET'
++export SERVER_PORT=8084
++export RECOVERY_ENABLED=true
++mvn spring-boot:run
++```
++
++Prefer interactive `read -r -s` instead of typing secrets in shell history. Both services use the **same booking_db** by design in this lab. Never run Flyway clean.
++
++```bash
++cd ~/Desktop/seatlock
++docker compose -f compose.yaml -f compose.part075.loadbalancer.yaml up -d booking-load-balancer
++curl -i http://localhost:8085/actuator/health
++```
++
++Set `BOOKING_URI=http://127.0.0.1:8085` in Gateway terminal and restart Gateway. Then client uses Gateway as before. Nginx will balance request traffic across Booking `8083` and `8084` (`least_conn`). Check the `X-Upstream-Addr` header by calling Nginx directly. Security is still enforced in both Booking instances.
++
++**What actually makes multi-instance safe?** PostgreSQL unique `(customer_id,idempotency_key)` for Booking, atomic seat UPDATE in Inventory, durable job leases with `SKIP LOCKED` + owner token fencing. An in-memory `synchronized` block in one JVM would NOT work across replicas.
++
++Test with default Gateway (no Redis rate limit) and the Python concurrency lab using a NEW test event. For high-traffic benchmarks: measure throughput, failures, p95, and `pg_stat_activity`/`pg_locks` and tune DB pool sizes; not done automatically here.
++
++## 9. Fresh Part 7 recovery regression (before any new work)
++
++You previously confirmed:
++
++```text
++booking b264193c-c8d3-4ca5-9983-87ca307dd6f7 => CONFIRMED
++```
++
++Now verify durable job `DONE` (old booking remains untouched):
++
++```bash
++docker compose exec -T postgres sh -c \
++'psql -U "$POSTGRES_USER" -d booking_db -c "
++SELECT b.status,j.state,j.attempt_count,j.last_error
++FROM bookings b JOIN booking_recovery_jobs j ON j.booking_id=b.id
++WHERE b.id = '\''b264193c-c8d3-4ca5-9983-87ca307dd6f7'\'';
++"'
++```
++
++Then run NEW failure simulation with `part07_recovery_demo.py` (original demo event) or adapt it to a new test event; verify `202 UNCERTAIN → CONFIRMED` without manual retry and job `DONE`. If AI CLI patched RecoveryJobStore or worker, this Part 7.5 patch **does not replace their code**.
++
++## 10. Operational limits / interview traps
++
++1. HOLD expiration is authoritative in PostgreSQL (`now()`), sweeper cleans due rows; even if sweeper late, atomic reserve can reclaim expired holds.
++2. CONFIRMED reservations have NO TTL. They are freed by explicit durable cancellation only.
++3. CANCELED booking ID has a durable tombstone and cannot resurrect via late retry.
++4. Cancellation is not strongly consistent across 2 DBs; state `CANCEL_PENDING` is intentionally visible until reconciliation.
++5. `EXHAUSTED` cancellation needs an operator; automatic reconciliation cannot guarantee liveness if Inventory is unavailable forever.
++6. Two Booking JVMs share booking_db but do NOT share in-memory locks. DB CAS, unique indexes, and leases enforce correctness.
++7. Redis rate limiting is not the source of truth for seat allocation.
++8. User ownership comes from JWT subject, never from client-provided customer ID.
++9. No payment or refund workflow exists here. If later adding payments, cancellation MUST coordinate refunds/compensations before becoming production ready.
++10. Server-side load test on a single Linux machine is a **lab**, not high-availability proof.
++
++## 11. Recommended validation order
++
++- `git apply --check` first, preserve user's existing recovery fix.
++- `mvn clean verify` for Inventory / Booking / Gateway; fix compilation errors before any live migration.
++- Run `BookingCancellationIntegrationTest` and `SeatHoldLifecycleIntegrationTest` using disposable PostgreSQL Testcontainers.
++- Backup DB, then start Inventory (`V4/V5`), Booking (`V3/V4`), Gateway.
++- Check health + Flyway migrations.
++- Run `part075_seed_event.sh`, export event ID.
++- Run holds smoke, cancellation smoke, Python concurrency test.
++- Inspect cancellation job + reservation tombstone SQL.
++- Repeat Part 7 recovery scenario to avoid regressions.
++- Optional Nginx two-instance, k6 and metrics.
++
++**Do not describe tests as PASS until you actually execute them on Ubuntu.**
+diff --git a/VALIDATION_PART075.md b/VALIDATION_PART075.md
+new file mode 100644
+index 0000000..5dfc379
+--- /dev/null
++++ b/VALIDATION_PART075.md
+@@ -0,0 +1,24 @@
++# Validation — Part 7.5
++
++## Verified in this build environment
++- Original Part 7 full project archive inspected.
++- Java 21 syntax parse of 83 Java source/test files: PASS (0 parse errors).
++- Python syntax for scripts: PASS.
++- YAML parsing: PASS.
++- Nginx configuration syntax (`nginx -t`): PASS.
++- Shell script syntax (`bash -n`): PASS.
++- Unified patch applied successfully to a clean Part 7 archive; 83 Java files then parsed successfully.
++- Expected package/source paths and non-destructive Flyway numbering checked.
++
++## NOT verified here
++- Maven build/test (Maven executable and Maven Central dependencies unavailable in this container).
++- Docker Compose, PostgreSQL/Testcontainers, Keycloak, live API and k6 (not running here).
++- The user's post-CLI-fixed Part 7 code: we have the archived Part 7 sources, not their local modified working tree. **Patch merge may conflict.**
++
++## Risks to test before claiming production readiness
++- Version alignment with the user's CLI recovery fix.
++- Live Flyway migrations and existing data backfill.
++- Concurrent hold creation and reservation, expiration, replay after cancel.
++- Cancellation worker job claiming, compensation, lease expiry, tombstones under crash scenarios.
++- Multi-replica load balancing and overload backpressure.
++- Actual security JWT/role enforcement in Keycloak realm.
+diff --git a/booking-service/src/main/java/com/seatlock/booking/api/BookingController.java b/booking-service/src/main/java/com/seatlock/booking/api/BookingController.java
+index fb32b46..0bc8506 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/api/BookingController.java
++++ b/booking-service/src/main/java/com/seatlock/booking/api/BookingController.java
+@@ -36,6 +36,14 @@ public class BookingController {
+                 .body(outcome.booking());
+     }
+ 
++    @PostMapping("/{id}/cancel")
++    public ResponseEntity<BookingView> cancel(
++            @AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
++        BookingView result = workflow.cancel(customerId(jwt), id);
++        return ResponseEntity.status(result.status() == BookingStatus.CANCELLED
++                        ? HttpStatus.OK : HttpStatus.ACCEPTED).body(result);
++    }
++
+     @GetMapping("/{id}")
+     public BookingView get(@AuthenticationPrincipal Jwt jwt, @PathVariable UUID id) {
+         return workflow.get(customerId(jwt), id);
+@@ -57,7 +65,8 @@ public class BookingController {
+         return switch (state) {
+             case CONFIRMED -> newlyCreated ? HttpStatus.CREATED : HttpStatus.OK;
+             case REJECTED -> HttpStatus.CONFLICT;
+-            case PENDING, UNCERTAIN -> HttpStatus.ACCEPTED;
++            case CANCELLED -> HttpStatus.OK;
++            case PENDING, UNCERTAIN, CANCEL_PENDING -> HttpStatus.ACCEPTED;
+         };
+     }
+ }
+diff --git a/booking-service/src/main/java/com/seatlock/booking/api/BookingExceptionHandler.java b/booking-service/src/main/java/com/seatlock/booking/api/BookingExceptionHandler.java
+index 1ebf8f4..d0e2590 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/api/BookingExceptionHandler.java
++++ b/booking-service/src/main/java/com/seatlock/booking/api/BookingExceptionHandler.java
+@@ -2,6 +2,9 @@ package com.seatlock.booking.api;
+ 
+ import com.seatlock.booking.application.BookingNotFoundException;
+ import com.seatlock.booking.application.IdempotencyMismatchException;
++import com.seatlock.booking.application.BookingCancellationConflictException;
++import com.seatlock.booking.application.HoldConflictException;
++import com.seatlock.booking.application.HoldUnavailableException;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ProblemDetail;
+ import org.springframework.http.ResponseEntity;
+@@ -23,6 +26,21 @@ public class BookingExceptionHandler {
+         return problem(HttpStatus.CONFLICT, "Idempotency conflict", ex.getMessage());
+     }
+ 
++    @ExceptionHandler(BookingCancellationConflictException.class)
++    ResponseEntity<ProblemDetail> cancelConflict(BookingCancellationConflictException ex) {
++        return problem(HttpStatus.CONFLICT, "Cancellation conflict", ex.getMessage());
++    }
++
++    @ExceptionHandler(HoldConflictException.class)
++    ResponseEntity<ProblemDetail> holdConflict(HoldConflictException ex) {
++        return problem(HttpStatus.CONFLICT, "Hold conflict", ex.getMessage());
++    }
++
++    @ExceptionHandler(HoldUnavailableException.class)
++    ResponseEntity<ProblemDetail> holdUnavailable(HoldUnavailableException ex) {
++        return problem(HttpStatus.SERVICE_UNAVAILABLE, "Inventory temporarily unavailable", ex.getMessage());
++    }
++
+     @ExceptionHandler({IllegalArgumentException.class, MethodArgumentNotValidException.class,
+             MissingRequestHeaderException.class, MethodArgumentTypeMismatchException.class})
+     ResponseEntity<ProblemDetail> badRequest(Exception ex) {
+diff --git a/booking-service/src/main/java/com/seatlock/booking/api/BookingView.java b/booking-service/src/main/java/com/seatlock/booking/api/BookingView.java
+index 9882290..a9b98cb 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/api/BookingView.java
++++ b/booking-service/src/main/java/com/seatlock/booking/api/BookingView.java
+@@ -7,10 +7,17 @@ import java.util.UUID;
+ 
+ public record BookingView(UUID id, UUID customerId, UUID eventId, UUID seatId,
+                           BookingStatus status, String failureReason,
+-                          Instant createdAt, Instant updatedAt) {
++                          Instant createdAt, Instant updatedAt, UUID holdId) {
++    // Preserve the constructor used by earlier Part 4/7 unit tests.
++    public BookingView(UUID id, UUID customerId, UUID eventId, UUID seatId,
++                       BookingStatus status, String failureReason,
++                       Instant createdAt, Instant updatedAt) {
++        this(id, customerId, eventId, seatId, status, failureReason, createdAt, updatedAt, null);
++    }
+     public static BookingView from(BookingEntity entity) {
+         return new BookingView(entity.getId(), entity.getCustomerId(),
+                 entity.getEventId(), entity.getSeatId(), entity.getStatus(),
+-                entity.getFailureReason(), entity.getCreatedAt(), entity.getUpdatedAt());
++                entity.getFailureReason(), entity.getCreatedAt(), entity.getUpdatedAt(),
++                entity.getHoldId());
+     }
+ }
+diff --git a/booking-service/src/main/java/com/seatlock/booking/api/CreateBookingRequest.java b/booking-service/src/main/java/com/seatlock/booking/api/CreateBookingRequest.java
+index 269aba0..0b9a605 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/api/CreateBookingRequest.java
++++ b/booking-service/src/main/java/com/seatlock/booking/api/CreateBookingRequest.java
+@@ -3,4 +3,7 @@ package com.seatlock.booking.api;
+ import jakarta.validation.constraints.NotNull;
+ import java.util.UUID;
+ 
+-public record CreateBookingRequest(@NotNull UUID eventId, @NotNull UUID seatId) { }
++public record CreateBookingRequest(@NotNull UUID eventId, @NotNull UUID seatId,
++                                   UUID holdId) {
++    public CreateBookingRequest(UUID eventId, UUID seatId) { this(eventId, seatId, null); }
++}
+diff --git a/booking-service/src/main/java/com/seatlock/booking/api/CreateHoldRequest.java b/booking-service/src/main/java/com/seatlock/booking/api/CreateHoldRequest.java
+new file mode 100644
+index 0000000..aba834a
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/api/CreateHoldRequest.java
+@@ -0,0 +1,4 @@
++package com.seatlock.booking.api;
++import jakarta.validation.constraints.NotNull;
++import java.util.UUID;
++public record CreateHoldRequest(@NotNull UUID eventId, @NotNull UUID seatId) { }
+diff --git a/booking-service/src/main/java/com/seatlock/booking/api/HoldController.java b/booking-service/src/main/java/com/seatlock/booking/api/HoldController.java
+new file mode 100644
+index 0000000..765f434
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/api/HoldController.java
+@@ -0,0 +1,34 @@
++package com.seatlock.booking.api;
++
++import com.seatlock.booking.application.HoldWorkflow;
++import jakarta.validation.Valid;
++import java.util.UUID;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.ResponseEntity;
++import org.springframework.security.core.annotation.AuthenticationPrincipal;
++import org.springframework.security.oauth2.jwt.Jwt;
++import org.springframework.web.bind.annotation.*;
++
++/** Browser never calls Inventory machine-only APIs. Customer identity is verified JWT sub. */
++@RestController
++@RequestMapping("/api/v1/holds")
++public class HoldController {
++    private final HoldWorkflow workflow;
++    public HoldController(HoldWorkflow workflow) { this.workflow = workflow; }
++
++    @PostMapping
++    public ResponseEntity<HoldView> create(@AuthenticationPrincipal Jwt jwt,
++            @RequestHeader("Idempotency-Key") String key,
++            @Valid @RequestBody CreateHoldRequest request) {
++        var outcome = workflow.create(UUID.fromString(jwt.getSubject()), key, request);
++        return ResponseEntity.status(outcome.created() ? HttpStatus.CREATED : HttpStatus.OK)
++                .body(outcome.receipt());
++    }
++
++    @DeleteMapping("/{holdId}")
++    public ResponseEntity<Void> cancel(@AuthenticationPrincipal Jwt jwt,
++            @PathVariable UUID holdId, @RequestParam UUID eventId, @RequestParam UUID seatId) {
++        workflow.cancel(UUID.fromString(jwt.getSubject()), eventId, seatId, holdId);
++        return ResponseEntity.noContent().build();
++    }
++}
+diff --git a/booking-service/src/main/java/com/seatlock/booking/api/HoldView.java b/booking-service/src/main/java/com/seatlock/booking/api/HoldView.java
+new file mode 100644
+index 0000000..da135ef
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/api/HoldView.java
+@@ -0,0 +1,5 @@
++package com.seatlock.booking.api;
++import java.time.Instant;
++import java.util.UUID;
++public record HoldView(UUID holdId, UUID eventId, UUID seatId,
++                       UUID customerId, Instant expiresAt, String status) { }
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/BookingCancellationConflictException.java b/booking-service/src/main/java/com/seatlock/booking/application/BookingCancellationConflictException.java
+new file mode 100644
+index 0000000..def9d0e
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/application/BookingCancellationConflictException.java
+@@ -0,0 +1,4 @@
++package com.seatlock.booking.application;
++public class BookingCancellationConflictException extends RuntimeException {
++    public BookingCancellationConflictException(String message) { super(message); }
++}
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/BookingCancellationWorker.java b/booking-service/src/main/java/com/seatlock/booking/application/BookingCancellationWorker.java
+new file mode 100644
+index 0000000..9ae0a63
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/application/BookingCancellationWorker.java
+@@ -0,0 +1,60 @@
++package com.seatlock.booking.application;
++
++import io.micrometer.core.instrument.MeterRegistry;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import java.util.List;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++/** Separate Saga worker; reserve retries and compensating release never interfere. */
++@Component
++@ConditionalOnProperty(prefix="seatlock.cancellation", name="enabled", havingValue="true", matchIfMissing=true)
++public class BookingCancellationWorker {
++    private static final Logger log=LoggerFactory.getLogger(BookingCancellationWorker.class);
++    private final CancellationJobStore jobs;
++    private final BookingStore store;
++    private final InventoryPort inventory;
++    private final MeterRegistry metrics;
++    private final int maxAttempts;
++
++    public BookingCancellationWorker(CancellationJobStore jobs, BookingStore store,
++            InventoryPort inventory, MeterRegistry metrics,
++            @Value("${seatlock.cancellation.max-attempts:12}") int maxAttempts) {
++        this.jobs=jobs;this.store=store;this.inventory=inventory;this.metrics=metrics;
++        if(maxAttempts<1) throw new IllegalArgumentException("maxAttempts must be >=1");
++        this.maxAttempts=maxAttempts;
++    }
++
++    @Scheduled(initialDelayString="${seatlock.cancellation.initial-delay-ms:3000}",
++               fixedDelayString="${seatlock.cancellation.poll-ms:2000}")
++    public void poll() {
++        List<CancellationLease> claimed;
++        try { claimed=jobs.claim(5,90); }
++        catch(RuntimeException ex){ log.error("Cannot claim cancellation jobs",ex);return; }
++        for(var lease:claimed) {
++            boolean released=false;
++            try {
++                var booking=store.internalBooking(lease.bookingId());
++                if (booking.status()==com.seatlock.booking.domain.BookingStatus.CANCELLED)
++                    released=true;
++                else {
++                    inventory.release(booking);
++                    released=true;
++                }
++            } catch(RuntimeException ex) {
++                log.warn("Cancellation release outcome unknown for booking {}: {}",
++                        lease.bookingId(),ex.getClass().getSimpleName());
++            }
++            try {
++                var updated=store.settleCancellation(lease,released,maxAttempts);
++                metrics.counter("seatlock.cancellation.outcomes","status",updated.status().name()).increment();
++            } catch(RuntimeException ex) {
++                log.error("Cancellation settlement failed for booking {}",lease.bookingId(),ex);
++                metrics.counter("seatlock.cancellation.errors").increment();
++            }
++        }
++    }
++}
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/BookingStore.java b/booking-service/src/main/java/com/seatlock/booking/application/BookingStore.java
+index b500897..404ff6a 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/application/BookingStore.java
++++ b/booking-service/src/main/java/com/seatlock/booking/application/BookingStore.java
+@@ -16,11 +16,14 @@ public class BookingStore {
+     private final BookingRepository bookings;
+     private final RecoveryJobStore jobs;
+     private final RetryBackoff backoff;
++    private final CancellationJobStore cancellations;
+ 
+-    public BookingStore(BookingRepository bookings, RecoveryJobStore jobs, RetryBackoff backoff) {
++    public BookingStore(BookingRepository bookings, RecoveryJobStore jobs,
++                        RetryBackoff backoff, CancellationJobStore cancellations) {
+         this.bookings = bookings;
+         this.jobs = jobs;
+         this.backoff = backoff;
++        this.cancellations = cancellations;
+     }
+ 
+     @Transactional(readOnly = true)
+@@ -45,8 +48,14 @@ public class BookingStore {
+     @Transactional
+     public BookingView insert(UUID customerId, String key,
+                               UUID eventId, UUID seatId, String fingerprint) {
++        return insert(customerId, key, eventId, seatId, fingerprint, null);
++    }
++
++    @Transactional
++    public BookingView insert(UUID customerId, String key,
++                              UUID eventId, UUID seatId, String fingerprint, UUID holdId) {
+         BookingEntity booking = new BookingEntity(
+-                UUID.randomUUID(), customerId, eventId, seatId, key, fingerprint);
++                UUID.randomUUID(), customerId, eventId, seatId, key, fingerprint, holdId);
+         BookingView result = BookingView.from(bookings.saveAndFlush(booking));
+         // Same transaction: a crash cannot leave a booking with no recovery job.
+         jobs.create(result.id());
+@@ -63,6 +72,46 @@ public class BookingStore {
+         return BookingView.from(booking);
+     }
+ 
++    /** ACID: CANCEL_PENDING booking and its cancellation job commit together. */
++    @Transactional
++    public BookingView beginCancellation(UUID customerId, UUID bookingId) {
++        BookingEntity booking = bookings.lockById(bookingId)
++                .orElseThrow(BookingNotFoundException::new);
++        if (!booking.getCustomerId().equals(customerId)) throw new BookingNotFoundException();
++        if (booking.getStatus() == BookingStatus.CONFIRMED) {
++            booking.startCancellation();
++            cancellations.create(bookingId);
++        } else if (booking.getStatus() != BookingStatus.CANCEL_PENDING
++                && booking.getStatus() != BookingStatus.CANCELLED) {
++            throw new BookingCancellationConflictException(
++                    "Only CONFIRMED bookings may be canceled");
++        }
++        return BookingView.from(booking);
++    }
++
++    /** Fenced worker settlement: no stale worker may mark a booking canceled. */
++    @Transactional
++    public BookingView settleCancellation(CancellationLease lease, boolean released, int maxAttempts) {
++        BookingEntity booking = bookings.lockById(lease.bookingId())
++                .orElseThrow(BookingNotFoundException::new);
++        if (!cancellations.ownsLease(lease)) return BookingView.from(booking);
++        if (booking.getStatus() == BookingStatus.CANCEL_PENDING) {
++            if (released) {
++                booking.completeCancellation();
++                cancellations.finish(lease);
++            } else {
++                boolean exhausted = lease.attempt() >= maxAttempts;
++                cancellations.postpone(lease, Instant.now().plus(
++                        backoff.delay(lease.bookingId(), lease.attempt())), exhausted);
++            }
++        } else if (booking.getStatus() == BookingStatus.CANCELLED) {
++            cancellations.finish(lease);
++        } else {
++            throw new IllegalStateException("Cancellation job attached to non-cancelable booking");
++        }
++        return BookingView.from(booking);
++    }
++
+     /** Fencing: a stale worker must not change Booking after losing the lease. */
+     @Transactional
+     public BookingView settleRecovery(RecoveryLease lease,
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/BookingWorkflow.java b/booking-service/src/main/java/com/seatlock/booking/application/BookingWorkflow.java
+index 2b7b8f3..cd3b733 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/application/BookingWorkflow.java
++++ b/booking-service/src/main/java/com/seatlock/booking/application/BookingWorkflow.java
+@@ -6,6 +6,10 @@ import com.seatlock.booking.domain.BookingStatus;
+ import org.springframework.dao.DataIntegrityViolationException;
+ import org.springframework.stereotype.Service;
+ import java.util.UUID;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.HexFormat;
+ import java.util.regex.Pattern;
+ 
+ /** Orchestrates independent local transactions and an idempotent remote call. */
+@@ -34,8 +38,10 @@ public class BookingWorkflow {
+ 
+         final BookingView pending;
+         try {
+-            pending = store.insert(customerId, key,
+-                    request.eventId(), request.seatId(), fingerprint);
++            pending = request.holdId() == null
++                    ? store.insert(customerId, key, request.eventId(), request.seatId(), fingerprint)
++                    : store.insert(customerId, key, request.eventId(), request.seatId(), fingerprint,
++                            request.holdId());
+         } catch (DataIntegrityViolationException duplicate) {
+             // The other concurrent INSERT committed its unique key first.
+             BookingView winner = store.byCustomerAndKey(customerId, key)
+@@ -46,13 +52,18 @@ public class BookingWorkflow {
+         return new Outcome(attempt(pending), true);
+     }
+ 
++    public BookingView cancel(UUID customerId, UUID id) {
++        return store.beginCancellation(customerId, id);
++    }
++
+     public BookingView get(UUID customerId, UUID id) {
+         return store.ownedBooking(customerId, id);
+     }
+ 
+     public BookingView retry(UUID customerId, UUID id) {
+         BookingView current = store.ownedBooking(customerId, id);
+-        if (current.status().isTerminal()) {
++        if (current.status().isTerminal()
++                || current.status() == BookingStatus.CANCEL_PENDING) {
+             return current;
+         }
+         // Same bookingId => Inventory's existing idempotency guard applies.
+@@ -66,15 +77,25 @@ public class BookingWorkflow {
+ 
+     private static String fingerprint(CreateBookingRequest request) {
+         // Stable and unambiguous for the two UUID fields in this MVP.
+-        return request.eventId() + ":" + request.seatId();
++        return fingerprint(request.eventId(), request.seatId(), request.holdId());
+     }
+ 
+-    private static void requireSameRequest(BookingView existing, String fingerprint) {
+-        String recorded = existing.eventId() + ":" + existing.seatId();
+-        if (!recorded.equals(fingerprint)) {
+-            throw new IdempotencyMismatchException();
++    private static String fingerprint(UUID eventId, UUID seatId, UUID holdId) {
++        if (holdId == null) return eventId + ":" + seatId; // Backward compatible fingerprint
++        try {
++            byte[] bytes = MessageDigest.getInstance("SHA-256").digest(
++                    ("hold-v1:" + eventId + ":" + seatId + ":" + holdId)
++                        .getBytes(StandardCharsets.UTF_8));
++            return HexFormat.of().formatHex(bytes);
++        } catch (NoSuchAlgorithmException ex) {
++            throw new IllegalStateException("SHA-256 is unavailable", ex);
+         }
+     }
+ 
++    private static void requireSameRequest(BookingView existing, String fingerprint) {
++        String recorded = fingerprint(existing.eventId(), existing.seatId(), existing.holdId());
++        if (!recorded.equals(fingerprint)) throw new IdempotencyMismatchException();
++    }
++
+     public record Outcome(BookingView booking, boolean created) { }
+ }
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/CancellationJobStore.java b/booking-service/src/main/java/com/seatlock/booking/application/CancellationJobStore.java
+new file mode 100644
+index 0000000..9388236
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/application/CancellationJobStore.java
+@@ -0,0 +1,74 @@
++package com.seatlock.booking.application;
++
++import java.sql.Timestamp;
++import java.time.Instant;
++import java.util.List;
++import java.util.UUID;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Repository;
++import org.springframework.transaction.annotation.Transactional;
++
++/** Durable cancellations and row-locked leases across arbitrary Booking replicas. */
++@Repository
++public class CancellationJobStore {
++    private final JdbcTemplate jdbc;
++    public CancellationJobStore(JdbcTemplate jdbc) { this.jdbc = jdbc; }
++
++    public void create(UUID bookingId) {
++        jdbc.update("""
++            INSERT INTO booking_cancellation_jobs(booking_id,state,next_attempt_at)
++            VALUES (?,'READY',now()) ON CONFLICT (booking_id) DO NOTHING
++            """, bookingId);
++    }
++
++    @Transactional
++    public List<CancellationLease> claim(int maxBatch, int leaseSeconds) {
++        UUID token = UUID.randomUUID();
++        return jdbc.query("""
++            WITH due AS (
++                SELECT j.booking_id FROM booking_cancellation_jobs j
++                JOIN bookings b ON b.id=j.booking_id
++                WHERE b.status='CANCEL_PENDING'
++                  AND ((j.state='READY' AND j.next_attempt_at <= now())
++                    OR (j.state='LEASED' AND j.lease_until < now()))
++                ORDER BY j.next_attempt_at, j.booking_id
++                LIMIT ? FOR UPDATE OF j SKIP LOCKED
++            )
++            UPDATE booking_cancellation_jobs j SET state='LEASED',owner_token=?,
++                lease_until=now() + (? * interval '1 second'),
++                attempt_count=j.attempt_count+1,updated_at=now()
++            FROM due WHERE j.booking_id=due.booking_id
++            RETURNING j.booking_id,j.attempt_count
++            """, (rs, num) -> new CancellationLease(
++                    rs.getObject("booking_id", UUID.class), token, rs.getInt("attempt_count")),
++                    maxBatch, token, leaseSeconds);
++    }
++
++    public boolean ownsLease(CancellationLease lease) {
++        Integer count=jdbc.queryForObject("""
++            SELECT count(*) FROM booking_cancellation_jobs
++            WHERE booking_id=? AND state='LEASED' AND owner_token=? AND lease_until>now()
++            """, Integer.class, lease.bookingId(),lease.token());
++        return count!=null && count==1;
++    }
++
++    public void finish(CancellationLease lease) {
++        int changed=jdbc.update("""
++            UPDATE booking_cancellation_jobs SET state='DONE',owner_token=NULL,
++                lease_until=NULL,last_error=NULL,updated_at=now()
++            WHERE booking_id=? AND state='LEASED' AND owner_token=? AND lease_until>now()
++            """, lease.bookingId(),lease.token());
++        if(changed!=1) throw new IllegalStateException("Cancellation lease lost");
++    }
++
++    public void postpone(CancellationLease lease, Instant next, boolean exhausted) {
++        int changed=jdbc.update("""
++            UPDATE booking_cancellation_jobs SET state=?,owner_token=NULL,
++                lease_until=NULL,last_error='Inventory release outcome unknown',
++                next_attempt_at=?,updated_at=now()
++            WHERE booking_id=? AND state='LEASED' AND owner_token=? AND lease_until>now()
++            """, exhausted ? "EXHAUSTED" : "READY", Timestamp.from(next),
++                lease.bookingId(),lease.token());
++        if(changed!=1) throw new IllegalStateException("Cancellation lease lost");
++    }
++}
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/CancellationLease.java b/booking-service/src/main/java/com/seatlock/booking/application/CancellationLease.java
+new file mode 100644
+index 0000000..7d5052e
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/application/CancellationLease.java
+@@ -0,0 +1,3 @@
++package com.seatlock.booking.application;
++import java.util.UUID;
++public record CancellationLease(UUID bookingId, UUID token, int attempt) { }
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/HoldConflictException.java b/booking-service/src/main/java/com/seatlock/booking/application/HoldConflictException.java
+new file mode 100644
+index 0000000..9e9c1d2
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/application/HoldConflictException.java
+@@ -0,0 +1,4 @@
++package com.seatlock.booking.application;
++public class HoldConflictException extends RuntimeException {
++    public HoldConflictException(String message) { super(message); }
++}
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/HoldPort.java b/booking-service/src/main/java/com/seatlock/booking/application/HoldPort.java
+new file mode 100644
+index 0000000..273052d
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/application/HoldPort.java
+@@ -0,0 +1,10 @@
++package com.seatlock.booking.application;
++import com.seatlock.booking.api.HoldView;
++import java.util.UUID;
++
++/** Hexagonal application port; machine JWT stays in HTTP adapter, never reaches controller. */
++public interface HoldPort {
++    HoldAttempt create(UUID eventId, UUID seatId, UUID customerId, UUID holdId);
++    void cancel(UUID eventId, UUID seatId, UUID customerId, UUID holdId);
++    record HoldAttempt(HoldView receipt, boolean created) { }
++}
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/HoldUnavailableException.java b/booking-service/src/main/java/com/seatlock/booking/application/HoldUnavailableException.java
+new file mode 100644
+index 0000000..640e328
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/application/HoldUnavailableException.java
+@@ -0,0 +1,5 @@
++package com.seatlock.booking.application;
++public class HoldUnavailableException extends RuntimeException {
++    public HoldUnavailableException(String message) { super(message); }
++    public HoldUnavailableException(String message, Throwable cause) { super(message, cause); }
++}
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/HoldWorkflow.java b/booking-service/src/main/java/com/seatlock/booking/application/HoldWorkflow.java
+new file mode 100644
+index 0000000..23a71aa
+--- /dev/null
++++ b/booking-service/src/main/java/com/seatlock/booking/application/HoldWorkflow.java
+@@ -0,0 +1,33 @@
++package com.seatlock.booking.application;
++
++import com.seatlock.booking.api.CreateHoldRequest;
++import java.nio.charset.StandardCharsets;
++import java.util.UUID;
++import java.util.regex.Pattern;
++import org.springframework.stereotype.Service;
++
++/** Deterministic hold UUID makes retries safe even if remote response was lost. */
++@Service
++public class HoldWorkflow {
++    private static final Pattern KEY = Pattern.compile("[A-Za-z0-9._-]{8,128}");
++    private final HoldPort inventory;
++    public HoldWorkflow(HoldPort inventory) { this.inventory = inventory; }
++
++    public HoldPort.HoldAttempt create(UUID owner, String idempotencyKey, CreateHoldRequest request) {
++        if (idempotencyKey == null || !KEY.matcher(idempotencyKey).matches()) {
++            throw new IllegalArgumentException("Idempotency-Key must contain 8-128 safe characters");
++        }
++        UUID holdId = holdId(owner, idempotencyKey);
++        return inventory.create(request.eventId(), request.seatId(), owner, holdId);
++    }
++
++    public void cancel(UUID owner, UUID eventId, UUID seatId, UUID holdId) {
++        inventory.cancel(eventId, seatId, owner, holdId);
++    }
++
++    static UUID holdId(UUID owner, String key) {
++        // Stable per authenticated customer + key across multiple Booking replicas.
++        return UUID.nameUUIDFromBytes(("seatlock-hold-v1:" + owner + ":" + key)
++                .getBytes(StandardCharsets.UTF_8));
++    }
++}
+diff --git a/booking-service/src/main/java/com/seatlock/booking/application/InventoryPort.java b/booking-service/src/main/java/com/seatlock/booking/application/InventoryPort.java
+index e9b40ab..ed26a9d 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/application/InventoryPort.java
++++ b/booking-service/src/main/java/com/seatlock/booking/application/InventoryPort.java
+@@ -6,6 +6,8 @@ import com.seatlock.booking.domain.BookingStatus;
+ /** Port (hexagonal architecture): workflow knows nothing about HTTP clients. */
+ public interface InventoryPort {
+     Attempt reserve(BookingView booking);
++    /** Idempotent compensation; an unreachable Inventory means retry is required. */
++    void release(BookingView booking);
+ 
+     record Attempt(BookingStatus status, String reason) {
+         public Attempt {
+diff --git a/booking-service/src/main/java/com/seatlock/booking/domain/BookingEntity.java b/booking-service/src/main/java/com/seatlock/booking/domain/BookingEntity.java
+index a8062c9..65e041a 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/domain/BookingEntity.java
++++ b/booking-service/src/main/java/com/seatlock/booking/domain/BookingEntity.java
+@@ -35,6 +35,9 @@ public class BookingEntity {
+     @Column(nullable = false, length = 16)
+     private BookingStatus status;
+ 
++    @Column(name = "hold_id")
++    private UUID holdId;
++
+     @Column(name = "failure_reason", length = 256)
+     private String failureReason;
+ 
+@@ -52,6 +55,12 @@ public class BookingEntity {
+ 
+     public BookingEntity(UUID id, UUID customerId, UUID eventId, UUID seatId,
+                          String idempotencyKey, String requestFingerprint) {
++        this(id, customerId, eventId, seatId, idempotencyKey, requestFingerprint, null);
++    }
++
++    public BookingEntity(UUID id, UUID customerId, UUID eventId, UUID seatId,
++                         String idempotencyKey, String requestFingerprint, UUID holdId) {
++        this.holdId = holdId;
+         this.id = id;
+         this.customerId = customerId;
+         this.eventId = eventId;
+@@ -64,7 +73,7 @@ public class BookingEntity {
+     }
+ 
+     public void transition(BookingStatus next, String reason) {
+-        if (this.status.isTerminal()) {
++        if (this.status.isTerminal() || this.status == BookingStatus.CANCEL_PENDING) {
+             return; // A delayed response cannot overwrite a committed decision.
+         }
+         this.status = next;
+@@ -72,6 +81,24 @@ public class BookingEntity {
+         this.updatedAt = Instant.now();
+     }
+ 
++    /** Cancellation is a separate Saga, not a normal reservation transition. */
++    public void startCancellation() {
++        if (status != BookingStatus.CONFIRMED) {
++            throw new IllegalStateException("Only confirmed bookings can start cancellation");
++        }
++        status = BookingStatus.CANCEL_PENDING;
++        updatedAt = Instant.now();
++    }
++
++    public void completeCancellation() {
++        if (status != BookingStatus.CANCEL_PENDING) {
++            throw new IllegalStateException("Booking is not awaiting cancellation");
++        }
++        status = BookingStatus.CANCELLED;
++        failureReason = null;
++        updatedAt = Instant.now();
++    }
++
+     public UUID getId() { return id; }
+     public UUID getCustomerId() { return customerId; }
+     public UUID getEventId() { return eventId; }
+@@ -80,6 +107,7 @@ public class BookingEntity {
+     public String getRequestFingerprint() { return requestFingerprint; }
+     public BookingStatus getStatus() { return status; }
+     public String getFailureReason() { return failureReason; }
++    public UUID getHoldId() { return holdId; }
+     public Instant getCreatedAt() { return createdAt; }
+     public Instant getUpdatedAt() { return updatedAt; }
+ }
+diff --git a/booking-service/src/main/java/com/seatlock/booking/domain/BookingStatus.java b/booking-service/src/main/java/com/seatlock/booking/domain/BookingStatus.java
+index 7d7a07e..7134941 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/domain/BookingStatus.java
++++ b/booking-service/src/main/java/com/seatlock/booking/domain/BookingStatus.java
+@@ -1,9 +1,9 @@
+ package com.seatlock.booking.domain;
+ 
+ public enum BookingStatus {
+-    PENDING, CONFIRMED, REJECTED, UNCERTAIN;
++    PENDING, CONFIRMED, REJECTED, UNCERTAIN, CANCEL_PENDING, CANCELLED;
+ 
+     public boolean isTerminal() {
+-        return this == CONFIRMED || this == REJECTED;
++        return this == CONFIRMED || this == REJECTED || this == CANCELLED;
+     }
+ }
+diff --git a/booking-service/src/main/java/com/seatlock/booking/infrastructure/RestInventoryAdapter.java b/booking-service/src/main/java/com/seatlock/booking/infrastructure/RestInventoryAdapter.java
+--- a/booking-service/src/main/java/com/seatlock/booking/infrastructure/RestInventoryAdapter.java
++++ b/booking-service/src/main/java/com/seatlock/booking/infrastructure/RestInventoryAdapter.java
+@@ -13,10 +13,11 @@
+ import java.net.http.HttpClient;
+ import java.time.Duration;
+ import java.util.Map;
++import java.util.HashMap;
+ import java.util.UUID;
+ 
+ @Component
+-public class RestInventoryAdapter implements InventoryPort {
++public class RestInventoryAdapter implements InventoryPort, com.seatlock.booking.application.HoldPort {
+     private final RestClient client;
+     private final MachineTokenProvider tokens;
+ 
+@@ -37,12 +38,18 @@
+     @Override
+     public Attempt reserve(BookingView booking) {
+         try {
++            Map<String, Object> payload = new HashMap<>();
++            payload.put("bookingId", booking.id());
++            if (booking.holdId() != null) {
++                payload.put("holdId", booking.holdId());
++                payload.put("customerId", booking.customerId());
++            }
+             var response = client.post()
+                     .uri("/api/v1/events/{eventId}/seats/{seatId}/reservations",
+                             booking.eventId(), booking.seatId())
+                     .headers(h -> h.setBearerAuth(tokens.bearerToken()))
+                     .contentType(MediaType.APPLICATION_JSON)
+-                    .body(Map.of("bookingId", booking.id()))
++                    .body(payload)
+                     .retrieve()
+                     .toEntity(InventoryReservation.class);
+ 
+@@ -65,6 +72,68 @@
+         }
+     }
+ 
++    @Override
++    public void release(BookingView booking) {
++        try {
++            client.delete()
++                    .headers(h -> h.setBearerAuth(tokens.bearerToken()))
++                    .uri("/api/v1/events/{eventId}/seats/{seatId}/reservations/{bookingId}",
++                            booking.eventId(), booking.seatId(), booking.id())
++                    .retrieve().toBodilessEntity();
++        } catch (RestClientException ex) {
++            throw new IllegalStateException("Inventory release outcome unknown", ex);
++        }
++    }
++
++    @Override
++    public com.seatlock.booking.application.HoldPort.HoldAttempt create(
++            UUID eventId, UUID seatId, UUID customerId, UUID holdId) {
++        try {
++            var response = client.post()
++                    .headers(h -> h.setBearerAuth(tokens.bearerToken()))
++                    .uri("/api/v1/events/{eventId}/seats/{seatId}/holds", eventId, seatId)
++                    .contentType(MediaType.APPLICATION_JSON)
++                    .body(Map.of("holdId", holdId, "customerId", customerId))
++                    .retrieve().toEntity(com.seatlock.booking.api.HoldView.class);
++            var receipt = response.getBody();
++            if (receipt == null || !holdId.equals(receipt.holdId())
++                    || !eventId.equals(receipt.eventId()) || !seatId.equals(receipt.seatId())
++                    || !customerId.equals(receipt.customerId()) || receipt.expiresAt() == null
++                    || !"HELD".equals(receipt.status())) {
++                throw new com.seatlock.booking.application.HoldUnavailableException(
++                        "Inventory returned an invalid hold receipt");
++            }
++            return new com.seatlock.booking.application.HoldPort.HoldAttempt(
++                    receipt, response.getStatusCode().value() == 201);
++        } catch (HttpClientErrorException.Conflict ex) {
++            throw new com.seatlock.booking.application.HoldConflictException(
++                    "Seat unavailable or idempotency key already bound to another seat");
++        } catch (HttpClientErrorException.NotFound ex) {
++            throw new com.seatlock.booking.application.HoldConflictException("Seat or event not found");
++        } catch (RestClientException ex) {
++            throw new com.seatlock.booking.application.HoldUnavailableException(
++                    "Temporary hold outcome unknown. Retry with the SAME Idempotency-Key", ex);
++        }
++    }
++
++    @Override
++    public void cancel(UUID eventId, UUID seatId, UUID customerId, UUID holdId) {
++        try {
++            client.delete()
++                    .headers(h -> h.setBearerAuth(tokens.bearerToken()))
++                    .uri(uri -> uri.path("/api/v1/events/{eventId}/seats/{seatId}/holds/{holdId}")
++                        .queryParam("customerId", customerId)
++                        .build(eventId, seatId, holdId))
++                    .retrieve().toBodilessEntity();
++        } catch (HttpClientErrorException.NotFound ex) {
++            throw new com.seatlock.booking.application.HoldConflictException(
++                    "Hold is absent, expired, converted to a reservation, or not owned");
++        } catch (RestClientException ex) {
++            throw new com.seatlock.booking.application.HoldUnavailableException(
++                    "Hold cancellation outcome unknown. Check or retry safely", ex);
++        }
++    }
++
+     public record InventoryReservation(UUID eventId, UUID seatId, UUID bookingId,
+                                         String status) { }
+ }
+diff --git a/booking-service/src/main/java/com/seatlock/booking/security/BookingSecurityConfig.java b/booking-service/src/main/java/com/seatlock/booking/security/BookingSecurityConfig.java
+index d02f47c..19d4eb5 100644
+--- a/booking-service/src/main/java/com/seatlock/booking/security/BookingSecurityConfig.java
++++ b/booking-service/src/main/java/com/seatlock/booking/security/BookingSecurityConfig.java
+@@ -20,7 +20,12 @@ public class BookingSecurityConfig {
+             .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+             .authorizeHttpRequests(auth -> auth
+                 .requestMatchers("/actuator/health", "/actuator/health/**", "/actuator/prometheus").permitAll()
+-                .requestMatchers(HttpMethod.POST, "/api/v1/bookings", "/api/v1/bookings/*/retry")
++                .requestMatchers(HttpMethod.POST, "/api/v1/holds")
++                    .hasAuthority("ROLE_customer")
++                .requestMatchers(HttpMethod.DELETE, "/api/v1/holds/*")
++                    .hasAuthority("ROLE_customer")
++                .requestMatchers(HttpMethod.POST, "/api/v1/bookings", "/api/v1/bookings/*/retry",
++                        "/api/v1/bookings/*/cancel")
+                     .hasAuthority("ROLE_customer")
+                 .requestMatchers(HttpMethod.GET, "/api/v1/bookings/*")
+                     .hasAuthority("ROLE_customer")
+diff --git a/booking-service/src/main/resources/application.yml b/booking-service/src/main/resources/application.yml
+index 81fda8f..40c41a2 100644
+--- a/booking-service/src/main/resources/application.yml
++++ b/booking-service/src/main/resources/application.yml
+@@ -52,3 +52,8 @@ seatlock:
+     batch-size: 5
+     lease-seconds: 90
+     max-attempts: 12
++  cancellation:
++    enabled: ${CANCELLATION_ENABLED:true}
++    initial-delay-ms: 3000
++    poll-ms: 2000
++    max-attempts: 12
+diff --git a/booking-service/src/main/resources/db/migration/V3__booking_hold_reference.sql b/booking-service/src/main/resources/db/migration/V3__booking_hold_reference.sql
+new file mode 100644
+index 0000000..274c3b3
+--- /dev/null
++++ b/booking-service/src/main/resources/db/migration/V3__booking_hold_reference.sql
+@@ -0,0 +1,3 @@
++-- Non-destructive: old bookings retain NULL, new bookings can reference an ephemeral hold.
++ALTER TABLE bookings ADD COLUMN hold_id UUID;
++CREATE INDEX idx_bookings_hold_id ON bookings(hold_id) WHERE hold_id IS NOT NULL;
+diff --git a/booking-service/src/main/resources/db/migration/V4__cancellation_jobs.sql b/booking-service/src/main/resources/db/migration/V4__cancellation_jobs.sql
+new file mode 100644
+index 0000000..46e879f
+--- /dev/null
++++ b/booking-service/src/main/resources/db/migration/V4__cancellation_jobs.sql
+@@ -0,0 +1,17 @@
++-- No destructive data migration. Durable Saga compensation for confirmed bookings.
++ALTER TABLE bookings DROP CONSTRAINT ck_bookings_status;
++ALTER TABLE bookings ADD CONSTRAINT ck_bookings_status CHECK (
++    status IN ('PENDING','CONFIRMED','REJECTED','UNCERTAIN','CANCEL_PENDING','CANCELLED')
++);
++CREATE TABLE booking_cancellation_jobs (
++    booking_id UUID PRIMARY KEY REFERENCES bookings(id) ON DELETE RESTRICT,
++    state VARCHAR(16) NOT NULL CHECK(state IN ('READY','LEASED','DONE','EXHAUSTED')),
++    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++    attempt_count INTEGER NOT NULL DEFAULT 0,
++    owner_token UUID,
++    lease_until TIMESTAMPTZ,
++    last_error VARCHAR(300),
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++CREATE INDEX idx_booking_cancellation_due ON booking_cancellation_jobs(next_attempt_at)
++    WHERE state IN ('READY','LEASED');
+diff --git a/booking-service/src/test/java/com/seatlock/booking/application/HoldWorkflowTest.java b/booking-service/src/test/java/com/seatlock/booking/application/HoldWorkflowTest.java
+new file mode 100644
+index 0000000..8b00a2e
+--- /dev/null
++++ b/booking-service/src/test/java/com/seatlock/booking/application/HoldWorkflowTest.java
+@@ -0,0 +1,37 @@
++package com.seatlock.booking.application;
++
++import com.seatlock.booking.api.CreateHoldRequest;
++import com.seatlock.booking.api.HoldView;
++import java.time.Instant;
++import java.util.UUID;
++import org.junit.jupiter.api.Test;
++import static org.assertj.core.api.Assertions.*;
++import static org.mockito.Mockito.*;
++
++class HoldWorkflowTest {
++    private final HoldPort port = mock(HoldPort.class);
++    private final HoldWorkflow workflow = new HoldWorkflow(port);
++
++    @Test
++    void sameAuthenticatedUserAndKeyGenerateStableHoldIdAcrossRetries() {
++        UUID owner = UUID.randomUUID(), event = UUID.randomUUID(), seat = UUID.randomUUID();
++        String key = "hold-key-123456";
++        UUID id = HoldWorkflow.holdId(owner, key);
++        HoldView receipt = new HoldView(id, event, seat, owner, Instant.now().plusSeconds(120), "HELD");
++        when(port.create(event,seat,owner,id)).thenReturn(new HoldPort.HoldAttempt(receipt,true));
++        assertThat(workflow.create(owner,key,new CreateHoldRequest(event,seat)).receipt().holdId())
++                .isEqualTo(id);
++        assertThat(workflow.create(owner,key,new CreateHoldRequest(event,seat)).receipt().holdId())
++                .isEqualTo(id);
++        verify(port, times(2)).create(event,seat,owner,id);
++        assertThat(HoldWorkflow.holdId(UUID.randomUUID(), key)).isNotEqualTo(id);
++    }
++
++    @Test
++    void rejectsInvalidIdempotencyKeyBeforeRemoteCall() {
++        assertThatThrownBy(() -> workflow.create(UUID.randomUUID(), "bad",
++                new CreateHoldRequest(UUID.randomUUID(), UUID.randomUUID())))
++                .isInstanceOf(IllegalArgumentException.class);
++        verifyNoInteractions(port);
++    }
++}
+diff --git a/booking-service/src/test/java/com/seatlock/booking/domain/BookingCancellationStateTest.java b/booking-service/src/test/java/com/seatlock/booking/domain/BookingCancellationStateTest.java
+new file mode 100644
+index 0000000..62ee127
+--- /dev/null
++++ b/booking-service/src/test/java/com/seatlock/booking/domain/BookingCancellationStateTest.java
+@@ -0,0 +1,29 @@
++package com.seatlock.booking.domain;
++
++import java.util.UUID;
++import org.junit.jupiter.api.Test;
++import static org.assertj.core.api.Assertions.*;
++
++class BookingCancellationStateTest {
++    @Test
++    void confirmedBookingCanCancelAndDelayedReserveCannotResurrectIt() {
++        var booking=new BookingEntity(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),
++                UUID.randomUUID(),"test-key-123456","fingerprint");
++        booking.transition(BookingStatus.CONFIRMED,null);
++        booking.startCancellation();
++        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCEL_PENDING);
++        booking.transition(BookingStatus.CONFIRMED,null); // stale remote response ignored
++        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCEL_PENDING);
++        booking.completeCancellation();
++        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
++        booking.transition(BookingStatus.CONFIRMED,null);
++        assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
++    }
++
++    @Test
++    void unconfirmedBookingCannotCancel() {
++        var booking=new BookingEntity(UUID.randomUUID(),UUID.randomUUID(),UUID.randomUUID(),
++                UUID.randomUUID(),"test-key-123456","fingerprint");
++        assertThatThrownBy(booking::startCancellation).isInstanceOf(IllegalStateException.class);
++    }
++}
+diff --git a/booking-service/src/test/java/com/seatlock/booking/integration/BookingCancellationIntegrationTest.java b/booking-service/src/test/java/com/seatlock/booking/integration/BookingCancellationIntegrationTest.java
+new file mode 100644
+index 0000000..b91e41c
+--- /dev/null
++++ b/booking-service/src/test/java/com/seatlock/booking/integration/BookingCancellationIntegrationTest.java
+@@ -0,0 +1,99 @@
++package com.seatlock.booking.integration;
++
++import com.seatlock.booking.application.BookingStore;
++import com.seatlock.booking.application.BookingCancellationConflictException;
++import com.seatlock.booking.application.CancellationJobStore;
++import com.seatlock.booking.application.CancellationLease;
++import com.seatlock.booking.domain.BookingStatus;
++import java.util.UUID;
++import java.util.concurrent.*;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.test.context.DynamicPropertyRegistry;
++import org.springframework.test.context.DynamicPropertySource;
++import org.testcontainers.junit.jupiter.Container;
++import org.testcontainers.junit.jupiter.Testcontainers;
++import org.testcontainers.postgresql.PostgreSQLContainer;
++import static org.assertj.core.api.Assertions.*;
++
++@Testcontainers
++@SpringBootTest(properties={"seatlock.recovery.enabled=false",
++        "seatlock.cancellation.enabled=false", "security.machine.client-secret=test-secret"})
++class BookingCancellationIntegrationTest {
++    @Container
++    static PostgreSQLContainer postgres=new PostgreSQLContainer("postgres:17-alpine")
++            .withDatabaseName("booking_cancellation_test");
++
++    @DynamicPropertySource
++    static void db(DynamicPropertyRegistry props) {
++        props.add("spring.datasource.url",postgres::getJdbcUrl);
++        props.add("spring.datasource.username",postgres::getUsername);
++        props.add("spring.datasource.password",postgres::getPassword);
++    }
++
++    @Autowired BookingStore store;
++    @Autowired CancellationJobStore jobs;
++    @Autowired JdbcTemplate jdbc;
++
++    private ConfirmedBooking confirmed() {
++        UUID user=UUID.randomUUID(), event=UUID.randomUUID(), seat=UUID.randomUUID();
++        var pending=store.insert(user,"cancel-"+UUID.randomUUID(),event,seat,event+":"+seat);
++        store.transition(pending.id(),BookingStatus.CONFIRMED,null);
++        return new ConfirmedBooking(user,pending.id());
++    }
++
++    @Test
++    void cancellationCreatesDurableJobInSameTransactionAndCompletesWithLease() {
++        var booking=confirmed();
++        var pending=store.beginCancellation(booking.customer(), booking.id());
++        assertThat(pending.status()).isEqualTo(BookingStatus.CANCEL_PENDING);
++        assertThat(jdbc.queryForObject("SELECT state FROM booking_cancellation_jobs WHERE booking_id=?",
++                String.class,booking.id())).isEqualTo("READY");
++        var claimed=jobs.claim(5,90).stream()
++                .filter(j->j.bookingId().equals(booking.id())).findFirst().orElseThrow();
++        var canceled=store.settleCancellation(claimed,true,12);
++        assertThat(canceled.status()).isEqualTo(BookingStatus.CANCELLED);
++        assertThat(jdbc.queryForObject("SELECT state FROM booking_cancellation_jobs WHERE booking_id=?",
++                String.class,booking.id())).isEqualTo("DONE");
++        assertThat(store.beginCancellation(booking.customer(), booking.id()).status())
++                .isEqualTo(BookingStatus.CANCELLED);
++        assertThatThrownBy(() -> store.beginCancellation(UUID.randomUUID(), booking.id()))
++                .isInstanceOf(com.seatlock.booking.application.BookingNotFoundException.class);
++    }
++
++    @Test
++    void concurrentWorkersCannotClaimSameCancellationJob() throws Exception {
++        var booking=confirmed();
++        store.beginCancellation(booking.customer(),booking.id());
++        var exec=Executors.newFixedThreadPool(2);
++        var start=new CountDownLatch(1);
++        try {
++            Callable<java.util.List<CancellationLease>> command=()->{start.await();return jobs.claim(1,90);};
++            var first=exec.submit(command);
++            var second=exec.submit(command);
++            start.countDown();
++            var all=new java.util.ArrayList<CancellationLease>();
++            all.addAll(first.get(15,TimeUnit.SECONDS));
++            all.addAll(second.get(15,TimeUnit.SECONDS));
++            assertThat(all.stream().filter(x->x.bookingId().equals(booking.id())).count())
++                    .isEqualTo(1);
++        } finally {start.countDown();exec.shutdownNow();}
++    }
++
++    @Test
++    void staleLeaseCannotMarkBookingCanceled() {
++        var booking=confirmed();
++        store.beginCancellation(booking.customer(),booking.id());
++        var lease=jobs.claim(1,90).getFirst();
++        jdbc.update("UPDATE booking_cancellation_jobs SET owner_token=? WHERE booking_id=?",
++                UUID.randomUUID(),booking.id());
++        assertThat(store.settleCancellation(lease,true,12).status())
++                .isEqualTo(BookingStatus.CANCEL_PENDING);
++        assertThat(jdbc.queryForObject("SELECT state FROM booking_cancellation_jobs WHERE booking_id=?",
++                String.class,booking.id())).isEqualTo("LEASED");
++    }
++
++    record ConfirmedBooking(UUID customer,UUID id) { }
++}
+diff --git a/compose.part075.loadbalancer.yaml b/compose.part075.loadbalancer.yaml
+new file mode 100644
+index 0000000..3e7ea5e
+--- /dev/null
++++ b/compose.part075.loadbalancer.yaml
+@@ -0,0 +1,9 @@
++# LOCAL LINUX ONLY: host network required because Boot binds 127.0.0.1.
++# Do not use this as a production deployment pattern.
++services:
++  booking-load-balancer:
++    image: nginx:stable-alpine
++    network_mode: host
++    volumes:
++      - ./infra/nginx/seatlock-booking.conf:/etc/nginx/conf.d/default.conf:ro
++    restart: unless-stopped
+diff --git a/gateway-service/src/main/java/com/seatlock/gateway/security/GatewaySecurityConfig.java b/gateway-service/src/main/java/com/seatlock/gateway/security/GatewaySecurityConfig.java
+index c9f39b8..d2d01de 100644
+--- a/gateway-service/src/main/java/com/seatlock/gateway/security/GatewaySecurityConfig.java
++++ b/gateway-service/src/main/java/com/seatlock/gateway/security/GatewaySecurityConfig.java
+@@ -23,7 +23,12 @@ public class GatewaySecurityConfig {
+                 .pathMatchers(HttpMethod.OPTIONS, "/**").permitAll()
+                 .pathMatchers("/actuator/health", "/actuator/health/**").permitAll()
+                 .pathMatchers(HttpMethod.GET, "/api/v1/events", "/api/v1/events/*/seats").permitAll()
+-                .pathMatchers(HttpMethod.POST, "/api/v1/bookings", "/api/v1/bookings/*/retry")
++                .pathMatchers(HttpMethod.POST, "/api/v1/holds")
++                    .hasAuthority("ROLE_customer")
++                .pathMatchers(HttpMethod.DELETE, "/api/v1/holds/*")
++                    .hasAuthority("ROLE_customer")
++                .pathMatchers(HttpMethod.POST, "/api/v1/bookings", "/api/v1/bookings/*/retry",
++                        "/api/v1/bookings/*/cancel")
+                     .hasAuthority("ROLE_customer")
+                 .pathMatchers(HttpMethod.GET, "/api/v1/bookings/*")
+                     .hasAuthority("ROLE_customer")
+diff --git a/gateway-service/src/main/resources/application.yml b/gateway-service/src/main/resources/application.yml
+index b92daad..bf80f02 100644
+--- a/gateway-service/src/main/resources/application.yml
++++ b/gateway-service/src/main/resources/application.yml
+@@ -29,6 +29,7 @@ spring:
+                 allowedMethods:
+                   - GET
+                   - POST
++                  - DELETE
+                   - OPTIONS
+                 allowedHeaders:
+                   - Authorization
+@@ -55,8 +56,8 @@ spring:
+             - id: booking-customer-api
+               uri: ${BOOKING_URI:http://127.0.0.1:8083}
+               predicates:
+-                - Path=/api/v1/bookings,/api/v1/bookings/*,/api/v1/bookings/*/retry
+-                - Method=GET,POST
++                - Path=/api/v1/bookings,/api/v1/bookings/*,/api/v1/bookings/*/retry,/api/v1/bookings/*/cancel,/api/v1/holds,/api/v1/holds/*
++                - Method=GET,POST,DELETE
+               filters:
+                 - RemoveRequestHeader=Cookie
+                 - RemoveRequestHeader=X-Demo-User
+diff --git a/infra/nginx/seatlock-booking.conf b/infra/nginx/seatlock-booking.conf
+new file mode 100644
+index 0000000..2f63ff2
+--- /dev/null
++++ b/infra/nginx/seatlock-booking.conf
+@@ -0,0 +1,24 @@
++# LOCAL LINUX DEMO ONLY. Uses host networking; Booking JVMs must be on 8083 and 8084.
++upstream seatlock_booking_pool {
++    least_conn;
++    server 127.0.0.1:8083 max_fails=2 fail_timeout=10s;
++    server 127.0.0.1:8084 max_fails=2 fail_timeout=10s;
++    keepalive 16;
++}
++server {
++    listen 127.0.0.1:8085;
++    server_name _;
++    location / {
++        proxy_pass http://seatlock_booking_pool;
++        proxy_http_version 1.1;
++        proxy_set_header Connection "";
++        proxy_set_header Host $http_host;
++        proxy_set_header Authorization $http_authorization;
++        proxy_set_header Idempotency-Key $http_idempotency_key;
++        proxy_set_header X-Request-ID $http_x_request_id;
++        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
++        proxy_connect_timeout 2s;
++        proxy_read_timeout 6s;
++        add_header X-Upstream-Addr $upstream_addr always;
++    }
++}
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/InventoryApplication.java b/inventory-service/src/main/java/com/seatlock/inventory/InventoryApplication.java
+index 55d91fc..73b4745 100644
+--- a/inventory-service/src/main/java/com/seatlock/inventory/InventoryApplication.java
++++ b/inventory-service/src/main/java/com/seatlock/inventory/InventoryApplication.java
+@@ -2,8 +2,10 @@ package com.seatlock.inventory;
+ 
+ import org.springframework.boot.SpringApplication;
+ import org.springframework.boot.autoconfigure.SpringBootApplication;
++import org.springframework.scheduling.annotation.EnableScheduling;
+ 
+ @SpringBootApplication
++@EnableScheduling
+ public class InventoryApplication {
+     public static void main(String[] args) {
+         SpringApplication.run(InventoryApplication.class, args);
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/api/ApiExceptionHandler.java b/inventory-service/src/main/java/com/seatlock/inventory/api/ApiExceptionHandler.java
+index a183c8f..d90d8d3 100644
+--- a/inventory-service/src/main/java/com/seatlock/inventory/api/ApiExceptionHandler.java
++++ b/inventory-service/src/main/java/com/seatlock/inventory/api/ApiExceptionHandler.java
+@@ -3,6 +3,8 @@ package com.seatlock.inventory.api;
+ import com.seatlock.inventory.application.EventNotFoundException;
+ import com.seatlock.inventory.application.InvalidPageException;
+ import com.seatlock.inventory.application.ReservationConflictException;
++import com.seatlock.inventory.application.SeatHoldConflictException;
++import com.seatlock.inventory.application.SeatHoldNotFoundException;
+ import com.seatlock.inventory.application.SeatNotFoundException;
+ import org.springframework.web.bind.MethodArgumentNotValidException;
+ import org.springframework.http.HttpStatus;
+@@ -33,6 +35,21 @@ public class ApiExceptionHandler {
+         return problem(HttpStatus.CONFLICT, "Reservation conflict", ex.getMessage());
+     }
+ 
++    @ExceptionHandler(SeatHoldConflictException.class)
++    public ResponseEntity<ProblemDetail> holdConflict(SeatHoldConflictException ex) {
++        return problem(HttpStatus.CONFLICT, "Seat hold conflict", ex.getMessage());
++    }
++
++    @ExceptionHandler(SeatHoldNotFoundException.class)
++    public ResponseEntity<ProblemDetail> holdNotFound(SeatHoldNotFoundException ex) {
++        return problem(HttpStatus.NOT_FOUND, "Seat hold not found", ex.getMessage());
++    }
++
++    @ExceptionHandler(IllegalArgumentException.class)
++    public ResponseEntity<ProblemDetail> invalidHold(IllegalArgumentException ex) {
++        return problem(HttpStatus.BAD_REQUEST, "Invalid seat hold request", ex.getMessage());
++    }
++
+     @ExceptionHandler(MethodArgumentNotValidException.class)
+     public ResponseEntity<ProblemDetail> invalidBody(MethodArgumentNotValidException ex) {
+         return problem(HttpStatus.BAD_REQUEST, "Invalid request", "bookingId must be a valid UUID");
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/api/HoldSeatRequest.java b/inventory-service/src/main/java/com/seatlock/inventory/api/HoldSeatRequest.java
+new file mode 100644
+index 0000000..8f7008a
+--- /dev/null
++++ b/inventory-service/src/main/java/com/seatlock/inventory/api/HoldSeatRequest.java
+@@ -0,0 +1,7 @@
++package com.seatlock.inventory.api;
++
++import jakarta.validation.constraints.NotNull;
++import java.util.UUID;
++
++/** Only machine-authenticated Booking Service can request a hold. */
++public record HoldSeatRequest(@NotNull UUID holdId, @NotNull UUID customerId) { }
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/api/InventoryController.java b/inventory-service/src/main/java/com/seatlock/inventory/api/InventoryController.java
+index 07fa6be..f570e69 100644
+--- a/inventory-service/src/main/java/com/seatlock/inventory/api/InventoryController.java
++++ b/inventory-service/src/main/java/com/seatlock/inventory/api/InventoryController.java
+@@ -6,6 +6,8 @@ import jakarta.validation.Valid;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import com.seatlock.inventory.application.SeatHoldService;
+ import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PathVariable;
+@@ -20,11 +22,13 @@ import java.util.UUID;
+ public class InventoryController {
+     private final InventoryQueryService service;
+     private final SeatReservationService reservations;
++    private final SeatHoldService holds;
+ 
+     public InventoryController(InventoryQueryService service,
+-                               SeatReservationService reservations) {
++                               SeatReservationService reservations, SeatHoldService holds) {
+         this.service = service;
+         this.reservations = reservations;
++        this.holds = holds;
+     }
+ 
+     @GetMapping
+@@ -39,13 +43,36 @@ public class InventoryController {
+             @PathVariable UUID eventId,
+             @PathVariable UUID seatId,
+             @Valid @RequestBody ReserveSeatRequest request) {
+-        var result = reservations.reserve(eventId, seatId, request.bookingId());
++        var result = reservations.reserve(eventId, seatId, request.bookingId(),
++                request.holdId(), request.customerId());
+         var response = new ReservationView(
+                 result.eventId(), result.seatId(), result.bookingId(), "RESERVED");
+         return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK)
+                 .body(response);
+     }
+ 
++    @DeleteMapping("/{eventId}/seats/{seatId}/reservations/{bookingId}")
++    public ResponseEntity<Void> cancelReservation(@PathVariable UUID eventId,
++            @PathVariable UUID seatId, @PathVariable UUID bookingId) {
++        reservations.release(eventId, seatId, bookingId);
++        return ResponseEntity.noContent().build();
++    }
++
++    @PostMapping("/{eventId}/seats/{seatId}/holds")
++    public ResponseEntity<SeatHoldView> hold(@PathVariable UUID eventId,
++             @PathVariable UUID seatId, @Valid @RequestBody HoldSeatRequest request) {
++        var outcome = holds.create(eventId, seatId, request.holdId(), request.customerId());
++        return ResponseEntity.status(outcome.created() ? HttpStatus.CREATED : HttpStatus.OK)
++                .body(outcome.receipt());
++    }
++
++    @DeleteMapping("/{eventId}/seats/{seatId}/holds/{holdId}")
++    public ResponseEntity<Void> cancelHold(@PathVariable UUID eventId, @PathVariable UUID seatId,
++             @PathVariable UUID holdId, @RequestParam UUID customerId) {
++        holds.cancel(eventId, seatId, holdId, customerId);
++        return ResponseEntity.noContent().build();
++    }
++
+     @GetMapping("/{eventId}/seats")
+     public PageResponse<SeatView> seats(
+             @PathVariable UUID eventId,
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/api/ReserveSeatRequest.java b/inventory-service/src/main/java/com/seatlock/inventory/api/ReserveSeatRequest.java
+index ec794ae..83a1975 100644
+--- a/inventory-service/src/main/java/com/seatlock/inventory/api/ReserveSeatRequest.java
++++ b/inventory-service/src/main/java/com/seatlock/inventory/api/ReserveSeatRequest.java
+@@ -3,4 +3,6 @@ package com.seatlock.inventory.api;
+ import jakarta.validation.constraints.NotNull;
+ import java.util.UUID;
+ 
+-public record ReserveSeatRequest(@NotNull UUID bookingId) { }
++public record ReserveSeatRequest(@NotNull UUID bookingId, UUID holdId, UUID customerId) {
++    public ReserveSeatRequest(UUID bookingId) { this(bookingId, null, null); }
++}
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/api/SeatHoldView.java b/inventory-service/src/main/java/com/seatlock/inventory/api/SeatHoldView.java
+new file mode 100644
+index 0000000..07ea31e
+--- /dev/null
++++ b/inventory-service/src/main/java/com/seatlock/inventory/api/SeatHoldView.java
+@@ -0,0 +1,7 @@
++package com.seatlock.inventory.api;
++
++import java.time.Instant;
++import java.util.UUID;
++
++public record SeatHoldView(UUID holdId, UUID eventId, UUID seatId,
++                           UUID customerId, Instant expiresAt, String status) { }
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/application/HoldRequestStore.java b/inventory-service/src/main/java/com/seatlock/inventory/application/HoldRequestStore.java
+new file mode 100644
+index 0000000..f1880a9
+--- /dev/null
++++ b/inventory-service/src/main/java/com/seatlock/inventory/application/HoldRequestStore.java
+@@ -0,0 +1,34 @@
++package com.seatlock.inventory.application;
++
++import java.util.Optional;
++import java.util.UUID;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Repository;
++
++/** Immutable idempotency history; same hold UUID can never be reassigned after expiry. */
++@Repository
++public class HoldRequestStore {
++    private final JdbcTemplate jdbc;
++    public HoldRequestStore(JdbcTemplate jdbc) { this.jdbc = jdbc; }
++
++    public Optional<Binding> find(UUID id) {
++        return jdbc.query("""
++                SELECT hold_id, event_id, seat_id, customer_id
++                FROM seat_hold_requests WHERE hold_id = ?
++                """, (rs, n) -> new Binding(
++                        rs.getObject("hold_id", UUID.class),
++                        rs.getObject("event_id", UUID.class),
++                        rs.getObject("seat_id", UUID.class),
++                        rs.getObject("customer_id", UUID.class)), id).stream().findFirst();
++    }
++
++    public void insert(UUID holdId, UUID eventId, UUID seatId, UUID owner) {
++        int inserted = jdbc.update("""
++            INSERT INTO seat_hold_requests(hold_id,event_id,seat_id,customer_id)
++            VALUES (?,?,?,?) ON CONFLICT(hold_id) DO NOTHING
++            """, holdId, eventId, seatId, owner);
++        if (inserted != 1) throw new SeatHoldConflictException("Hold ID was already used");
++    }
++
++    public record Binding(UUID holdId, UUID eventId, UUID seatId, UUID customerId) { }
++}
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/application/ReservationHistoryStore.java b/inventory-service/src/main/java/com/seatlock/inventory/application/ReservationHistoryStore.java
+new file mode 100644
+index 0000000..56f70d2
+--- /dev/null
++++ b/inventory-service/src/main/java/com/seatlock/inventory/application/ReservationHistoryStore.java
+@@ -0,0 +1,53 @@
++package com.seatlock.inventory.application;
++
++import java.util.Optional;
++import java.util.UUID;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Repository;
++
++/** Immutable booking/seat binding with a cancellation tombstone. */
++@Repository
++public class ReservationHistoryStore {
++    private final JdbcTemplate jdbc;
++    public ReservationHistoryStore(JdbcTemplate jdbc) { this.jdbc=jdbc; }
++
++    public Optional<Binding> find(UUID bookingId) {
++        return jdbc.query("""
++            SELECT booking_id,event_id,seat_id,state FROM seat_reservation_history
++            WHERE booking_id=?
++            """, (rs,n) -> new Binding(
++                rs.getObject("booking_id",UUID.class),rs.getObject("event_id",UUID.class),
++                rs.getObject("seat_id",UUID.class),rs.getString("state")), bookingId)
++                .stream().findFirst();
++    }
++
++    /** Lock the booking history row before releasing its seat. */
++    public Optional<Binding> lock(UUID bookingId) {
++        return jdbc.query("""
++            SELECT booking_id,event_id,seat_id,state FROM seat_reservation_history
++            WHERE booking_id=? FOR UPDATE
++            """, (rs,n) -> new Binding(
++                rs.getObject("booking_id",UUID.class),rs.getObject("event_id",UUID.class),
++                rs.getObject("seat_id",UUID.class),rs.getString("state")), bookingId)
++                .stream().findFirst();
++    }
++
++    public void insert(UUID bookingId, UUID eventId, UUID seatId) {
++        int inserted=jdbc.update("""
++            INSERT INTO seat_reservation_history(booking_id,event_id,seat_id,state)
++            VALUES (?,?,?,'ACTIVE') ON CONFLICT(booking_id) DO NOTHING
++            """,bookingId,eventId,seatId);
++        if(inserted != 1) throw new ReservationConflictException(
++                "Booking ID was already used, or its reservation was canceled");
++    }
++
++    public void markCanceled(UUID bookingId) {
++        int changed=jdbc.update("""
++            UPDATE seat_reservation_history SET state='CANCELLED',updated_at=now()
++            WHERE booking_id=? AND state='ACTIVE'
++            """, bookingId);
++        if(changed!=1) throw new IllegalStateException("Reservation history cancellation failed");
++    }
++
++    public record Binding(UUID bookingId,UUID eventId,UUID seatId,String state) { }
++}
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldConflictException.java b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldConflictException.java
+new file mode 100644
+index 0000000..e66e393
+--- /dev/null
++++ b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldConflictException.java
+@@ -0,0 +1,4 @@
++package com.seatlock.inventory.application;
++public class SeatHoldConflictException extends RuntimeException {
++    public SeatHoldConflictException(String reason) { super(reason); }
++}
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldExpiryWorker.java b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldExpiryWorker.java
+new file mode 100644
+index 0000000..39ac09b
+--- /dev/null
++++ b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldExpiryWorker.java
+@@ -0,0 +1,25 @@
++package com.seatlock.inventory.application;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
++import org.springframework.stereotype.Component;
++
++@Component
++@ConditionalOnProperty(prefix="seatlock.holds", name="enabled", havingValue="true", matchIfMissing=true)
++public class SeatHoldExpiryWorker {
++    private static final Logger log = LoggerFactory.getLogger(SeatHoldExpiryWorker.class);
++    private final SeatHoldService holds;
++    public SeatHoldExpiryWorker(SeatHoldService holds) { this.holds = holds; }
++
++    @Scheduled(fixedDelayString = "${seatlock.holds.sweep-ms:2000}")
++    public void sweep() {
++        try {
++            int count = holds.expireDue();
++            if (count > 0) log.info("Expired {} temporary seat holds", count);
++        } catch (RuntimeException ex) {
++            log.error("Seat hold expiration failed", ex);
++        }
++    }
++}
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldNotFoundException.java b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldNotFoundException.java
+new file mode 100644
+index 0000000..3cb5ca9
+--- /dev/null
++++ b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldNotFoundException.java
+@@ -0,0 +1,4 @@
++package com.seatlock.inventory.application;
++public class SeatHoldNotFoundException extends RuntimeException {
++    public SeatHoldNotFoundException() { super("Active hold not found for this customer and seat"); }
++}
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldService.java b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldService.java
+new file mode 100644
+index 0000000..37c8c09
+--- /dev/null
++++ b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatHoldService.java
+@@ -0,0 +1,97 @@
++package com.seatlock.inventory.application;
++
++import com.seatlock.inventory.api.SeatHoldView;
++import com.seatlock.inventory.domain.SeatEntity;
++import com.seatlock.inventory.domain.SeatStatus;
++import com.seatlock.inventory.persistence.SeatRepository;
++import java.time.Instant;
++import java.util.UUID;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.dao.DataIntegrityViolationException;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.annotation.Transactional;
++
++/** Short-lived claim; NOT a confirmed reservation. PostgreSQL row locks serialize competing updates. */
++@Service
++public class SeatHoldService {
++    private final SeatRepository seats;
++    private final HoldRequestStore history;
++    private final int ttlSeconds;
++
++    public SeatHoldService(SeatRepository seats, HoldRequestStore history,
++            @Value("${seatlock.holds.ttl-seconds:120}") int ttlSeconds) {
++        if (ttlSeconds < 10 || ttlSeconds > 600) {
++            throw new IllegalArgumentException("Hold TTL must be between 10 and 600 seconds");
++        }
++        this.seats = seats;
++        this.history = history;
++        this.ttlSeconds = ttlSeconds;
++    }
++
++    @Transactional
++    public Outcome create(UUID eventId, UUID seatId, UUID holdId, UUID customerId) {
++        var prior = history.find(holdId);
++        if (prior.isPresent()) {
++            var binding = prior.get();
++            if (!binding.eventId().equals(eventId) || !binding.seatId().equals(seatId)
++                    || !binding.customerId().equals(customerId)) {
++                throw new SeatHoldConflictException("Hold ID already bound to a different request");
++            }
++            var active = seats.findByHoldId(holdId);
++            if (active.isEmpty()) throw new SeatHoldConflictException("Hold was consumed or expired; use a new key");
++            return new Outcome(validateReplay(active.get(), eventId, seatId, customerId), false);
++        }
++        var existing = seats.findByHoldId(holdId);
++        if (existing.isPresent()) return new Outcome(validateReplay(existing.get(), eventId, seatId, customerId), false);
++        int updated;
++        try {
++            updated = seats.holdIfAvailable(eventId, seatId, holdId, customerId, ttlSeconds);
++        } catch (DataIntegrityViolationException ex) {
++            // A hold ID cannot be assigned to two seats. Never make an alternate claim.
++            throw new SeatHoldConflictException("Hold ID already in use");
++        }
++        if (updated == 0) {
++            var seat = seats.findById(seatId)
++                .filter(s -> s.getEvent().getId().equals(eventId))
++                .orElseThrow(() -> new SeatNotFoundException(seatId, eventId));
++            if (holdId.equals(seat.getHoldId())) {
++                return new Outcome(validateReplay(seat, eventId, seatId, customerId), false);
++            }
++            throw new SeatHoldConflictException("Seat unavailable for a temporary hold");
++        }
++        // Same ACID transaction as seat UPDATE. On concurrent duplicate INSERT,
++        // PostgreSQL rejects one without ever committing a second seat hold.
++        history.insert(holdId, eventId, seatId, customerId);
++        SeatEntity held = seats.findByHoldId(holdId)
++                .orElseThrow(() -> new IllegalStateException("Hold claim was not visible"));
++        return new Outcome(view(held), true);
++    }
++
++    @Transactional
++    public void cancel(UUID eventId, UUID seatId, UUID holdId, UUID customerId) {
++        int updated = seats.releaseOwnedHold(eventId, seatId, holdId, customerId);
++        if (updated != 1) throw new SeatHoldNotFoundException();
++    }
++
++    @Transactional
++    public int expireDue() {
++        // Multiple workers can run this safely: UPDATE only matching HELD rows.
++        return seats.expireDueHolds();
++    }
++
++    private static SeatHoldView validateReplay(SeatEntity seat, UUID event, UUID seatId, UUID owner) {
++        if (!seat.getId().equals(seatId) || !seat.getEvent().getId().equals(event)
++                || !owner.equals(seat.getHoldCustomerId()) || seat.getStatus() != SeatStatus.HELD
++                || !seat.getHoldExpiresAt().isAfter(Instant.now())) {
++            throw new SeatHoldConflictException("Hold ID is already bound, expired, or not owned");
++        }
++        return view(seat);
++    }
++
++    private static SeatHoldView view(SeatEntity seat) {
++        return new SeatHoldView(seat.getHoldId(), seat.getEvent().getId(), seat.getId(),
++                seat.getHoldCustomerId(), seat.getHoldExpiresAt(), "HELD");
++    }
++
++    public record Outcome(SeatHoldView receipt, boolean created) { }
++}
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/application/SeatReservationService.java b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatReservationService.java
+index 187e147..8664554 100644
+--- a/inventory-service/src/main/java/com/seatlock/inventory/application/SeatReservationService.java
++++ b/inventory-service/src/main/java/com/seatlock/inventory/application/SeatReservationService.java
+@@ -13,14 +13,40 @@ import java.util.UUID;
+ @Service
+ public class SeatReservationService {
+     private final SeatRepository seats;
++    private final ReservationHistoryStore history;
+ 
+-    public SeatReservationService(SeatRepository seats) {
++    public SeatReservationService(SeatRepository seats, ReservationHistoryStore history) {
+         this.seats = seats;
++        this.history = history;
+     }
+ 
+     @Transactional
+     public ReservationResult reserve(UUID eventId, UUID seatId, UUID bookingId) {
+-        // Retry of an already committed booking: no new write required.
++        return reserve(eventId, seatId, bookingId, null, null);
++    }
++
++    @Transactional
++    public ReservationResult reserve(UUID eventId, UUID seatId, UUID bookingId,
++                                     UUID holdId, UUID customerId) {
++        if ((holdId == null) != (customerId == null)) {
++            throw new IllegalArgumentException("holdId and customerId must both be present");
++        }
++        // A cancellation tombstone blocks any late retry from resurrecting a seat.
++        var recorded = history.lock(bookingId);
++        if (recorded.isPresent()) {
++            var binding = recorded.get();
++            if (!binding.eventId().equals(eventId) || !binding.seatId().equals(seatId)
++                    || !"ACTIVE".equals(binding.state())) {
++                throw new ReservationConflictException("Booking ID was canceled or bound to another seat");
++            }
++            var active = seats.findByReservationId(bookingId);
++            if (active.isEmpty() || !active.get().getId().equals(seatId)) {
++                throw new IllegalStateException("ACTIVE reservation history does not match seat ownership");
++            }
++            return new ReservationResult(eventId, seatId, bookingId, false);
++        }
++
++        // Legacy idempotent reservation path. All successful new claims also enter history.
+         var existing = seats.findByReservationId(bookingId);
+         if (existing.isPresent()) {
+             var seat = existing.get();
+@@ -35,7 +61,9 @@ public class SeatReservationService {
+         // One conditional UPDATE, not SELECT followed by save().
+         final int changed;
+         try {
+-            changed = seats.claimIfAvailable(eventId, seatId, bookingId);
++            changed = holdId == null
++                    ? seats.claimIfAvailable(eventId, seatId, bookingId)
++                    : seats.claimOwnedHold(eventId, seatId, bookingId, holdId, customerId);
+         } catch (DataIntegrityViolationException ex) {
+             if (isReservationIdUniqueViolation(ex)) {
+                 // A concurrent request used the same bookingId for another seat.
+@@ -45,6 +73,8 @@ public class SeatReservationService {
+         }
+ 
+         if (changed == 1) {
++            // Same DB transaction as conditional seat UPDATE; no post-cancel resurrection.
++            history.insert(bookingId, eventId, seatId);
+             return new ReservationResult(eventId, seatId, bookingId, true);
+         }
+ 
+@@ -61,6 +91,20 @@ public class SeatReservationService {
+         throw new ReservationConflictException("Seat is already reserved");
+     }
+ 
++    /** Idempotent CAS compensation: never releases a new booking owner's seat. */
++    @Transactional
++    public void release(UUID eventId, UUID seatId, UUID bookingId) {
++        var binding = history.lock(bookingId)
++                .orElseThrow(() -> new IllegalStateException("Missing reservation history"));
++        if (!binding.eventId().equals(eventId) || !binding.seatId().equals(seatId)) {
++            throw new ReservationConflictException("Booking ID belongs to another seat");
++        }
++        if ("CANCELLED".equals(binding.state())) return; // idempotent replay
++        int updated = seats.releaseReservationIfOwned(eventId, seatId, bookingId);
++        if (updated != 1) throw new IllegalStateException("Reservation history/seat ownership mismatch");
++        history.markCanceled(bookingId);
++    }
++
+     private static boolean isReservationIdUniqueViolation(Throwable error) {
+         for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+             if (cause instanceof SQLException sql
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/domain/SeatEntity.java b/inventory-service/src/main/java/com/seatlock/inventory/domain/SeatEntity.java
+index 534b14b..09a01d7 100644
+--- a/inventory-service/src/main/java/com/seatlock/inventory/domain/SeatEntity.java
++++ b/inventory-service/src/main/java/com/seatlock/inventory/domain/SeatEntity.java
+@@ -34,6 +34,15 @@ public class SeatEntity {
+     @Column(name = "reservation_id")
+     private UUID reservationId;
+ 
++    @Column(name = "hold_id")
++    private UUID holdId;
++
++    @Column(name = "hold_customer_id")
++    private UUID holdCustomerId;
++
++    @Column(name = "hold_expires_at")
++    private java.time.Instant holdExpiresAt;
++
+     protected SeatEntity() {
+         // Required by JPA.
+     }
+@@ -49,4 +58,7 @@ public class SeatEntity {
+     public String getLabel() { return label; }
+     public SeatStatus getStatus() { return status; }
+     public UUID getReservationId() { return reservationId; }
++    public UUID getHoldId() { return holdId; }
++    public UUID getHoldCustomerId() { return holdCustomerId; }
++    public java.time.Instant getHoldExpiresAt() { return holdExpiresAt; }
+ }
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/domain/SeatStatus.java b/inventory-service/src/main/java/com/seatlock/inventory/domain/SeatStatus.java
+index 2df5059..4e63ba5 100644
+--- a/inventory-service/src/main/java/com/seatlock/inventory/domain/SeatStatus.java
++++ b/inventory-service/src/main/java/com/seatlock/inventory/domain/SeatStatus.java
+@@ -2,5 +2,6 @@ package com.seatlock.inventory.domain;
+ 
+ public enum SeatStatus {
+     AVAILABLE,
++    HELD,
+     RESERVED
+ }
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/persistence/SeatRepository.java b/inventory-service/src/main/java/com/seatlock/inventory/persistence/SeatRepository.java
+index 0af3b4a..d7d82e0 100644
+--- a/inventory-service/src/main/java/com/seatlock/inventory/persistence/SeatRepository.java
++++ b/inventory-service/src/main/java/com/seatlock/inventory/persistence/SeatRepository.java
+@@ -15,16 +15,81 @@ public interface SeatRepository extends JpaRepository<SeatEntity, UUID> {
+     Page<SeatEntity> findByEvent_Id(UUID eventId, Pageable pageable);
+ 
+     Optional<SeatEntity> findByReservationId(UUID bookingId);
++    Optional<SeatEntity> findByHoldId(UUID holdId);
++
++    @Modifying(flushAutomatically = true, clearAutomatically = true)
++    @Query(value = """
++            UPDATE seats SET status = 'HELD', hold_id = :holdId,
++                hold_customer_id = :customerId,
++                hold_expires_at = now() + (:ttlSeconds * interval '1 second'),
++                reservation_id = NULL
++            WHERE id = :seatId AND event_id = :eventId
++              AND (status = 'AVAILABLE' OR
++                   (status = 'HELD' AND hold_expires_at <= now()))
++            """, nativeQuery = true)
++    int holdIfAvailable(@Param("eventId") UUID eventId,
++                        @Param("seatId") UUID seatId,
++                        @Param("holdId") UUID holdId,
++                        @Param("customerId") UUID customerId,
++                        @Param("ttlSeconds") int ttlSeconds);
++
++    @Modifying(flushAutomatically = true, clearAutomatically = true)
++    @Query(value = """
++            UPDATE seats SET status = 'AVAILABLE', hold_id = NULL,
++                hold_customer_id = NULL, hold_expires_at = NULL
++            WHERE id = :seatId AND event_id = :eventId AND status = 'HELD'
++              AND hold_id = :holdId AND hold_customer_id = :customerId
++            """, nativeQuery = true)
++    int releaseOwnedHold(@Param("eventId") UUID eventId,
++                         @Param("seatId") UUID seatId,
++                         @Param("holdId") UUID holdId,
++                         @Param("customerId") UUID customerId);
++
++    @Modifying(flushAutomatically = true, clearAutomatically = true)
++    @Query(value = """
++            UPDATE seats SET status = 'AVAILABLE', hold_id = NULL,
++                hold_customer_id = NULL, hold_expires_at = NULL
++            WHERE status = 'HELD' AND hold_expires_at <= now()
++            """, nativeQuery = true)
++    int expireDueHolds();
++
++    @Modifying(flushAutomatically = true, clearAutomatically = true)
++    @Query(value = """
++            UPDATE seats SET status = 'RESERVED', reservation_id = :bookingId,
++                hold_id = NULL, hold_customer_id = NULL, hold_expires_at = NULL
++            WHERE id = :seatId AND event_id = :eventId
++              AND status = 'HELD' AND hold_id = :holdId
++              AND hold_customer_id = :customerId AND hold_expires_at > now()
++              AND reservation_id IS NULL
++            """, nativeQuery = true)
++    int claimOwnedHold(@Param("eventId") UUID eventId,
++                       @Param("seatId") UUID seatId,
++                       @Param("bookingId") UUID bookingId,
++                       @Param("holdId") UUID holdId,
++                       @Param("customerId") UUID customerId);
++
+ 
+     @Modifying(flushAutomatically = true, clearAutomatically = true)
+     @Query(value = """
+             UPDATE seats
+-            SET status = 'RESERVED', reservation_id = :bookingId
++            SET status = 'RESERVED', reservation_id = :bookingId,
++                hold_id = NULL, hold_customer_id = NULL, hold_expires_at = NULL
+             WHERE id = :seatId
+               AND event_id = :eventId
+-              AND status = 'AVAILABLE'
++              AND (status = 'AVAILABLE' OR
++                   (status = 'HELD' AND hold_expires_at <= now()))
+               AND reservation_id IS NULL
+             """, nativeQuery = true)
++    @Modifying(flushAutomatically = true, clearAutomatically = true)
++    @Query(value = """
++            UPDATE seats SET status='AVAILABLE', reservation_id=NULL
++            WHERE id=:seatId AND event_id=:eventId AND status='RESERVED'
++              AND reservation_id=:bookingId
++            """, nativeQuery = true)
++    int releaseReservationIfOwned(@Param("eventId") UUID eventId,
++                                  @Param("seatId") UUID seatId,
++                                  @Param("bookingId") UUID bookingId);
++
+     int claimIfAvailable(@Param("eventId") UUID eventId,
+                          @Param("seatId") UUID seatId,
+                          @Param("bookingId") UUID bookingId);
+diff --git a/inventory-service/src/main/java/com/seatlock/inventory/security/InventorySecurityConfig.java b/inventory-service/src/main/java/com/seatlock/inventory/security/InventorySecurityConfig.java
+index 4c57013..894959f 100644
+--- a/inventory-service/src/main/java/com/seatlock/inventory/security/InventorySecurityConfig.java
++++ b/inventory-service/src/main/java/com/seatlock/inventory/security/InventorySecurityConfig.java
+@@ -22,6 +22,12 @@ public class InventorySecurityConfig {
+                 .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
+                 .requestMatchers(HttpMethod.GET, "/api/v1/events", "/api/v1/events/*/seats")
+                     .permitAll()
++                .requestMatchers(HttpMethod.DELETE, "/api/v1/events/*/seats/*/reservations/*")
++                    .hasAuthority("ROLE_inventory.reserve")
++                .requestMatchers(HttpMethod.POST, "/api/v1/events/*/seats/*/holds")
++                    .hasAuthority("ROLE_inventory.reserve")
++                .requestMatchers(HttpMethod.DELETE, "/api/v1/events/*/seats/*/holds/*")
++                    .hasAuthority("ROLE_inventory.reserve")
+                 .requestMatchers(HttpMethod.POST, "/api/v1/events/*/seats/*/reservations")
+                     .hasAuthority("ROLE_inventory.reserve")
+                 .anyRequest().denyAll())
+diff --git a/inventory-service/src/main/resources/application.yml b/inventory-service/src/main/resources/application.yml
+index 3f03460..05ce7d8 100644
+--- a/inventory-service/src/main/resources/application.yml
++++ b/inventory-service/src/main/resources/application.yml
+@@ -33,3 +33,9 @@ management:
+       exposure:
+         include: health,info
+ 
++
++seatlock:
++  holds:
++    enabled: ${SEAT_HOLD_EXPIRY_ENABLED:true}
++    ttl-seconds: ${SEAT_HOLD_TTL_SECONDS:120}
++    sweep-ms: ${SEAT_HOLD_SWEEP_MS:2000}
+diff --git a/inventory-service/src/main/resources/db/migration/V4__temporary_seat_holds.sql b/inventory-service/src/main/resources/db/migration/V4__temporary_seat_holds.sql
+new file mode 100644
+index 0000000..b9c1256
+--- /dev/null
++++ b/inventory-service/src/main/resources/db/migration/V4__temporary_seat_holds.sql
+@@ -0,0 +1,31 @@
++-- Add a separate, expiring HELD state. NEVER expire a committed RESERVED seat.
++ALTER TABLE seats
++    ADD COLUMN hold_id UUID,
++    ADD COLUMN hold_customer_id UUID,
++    ADD COLUMN hold_expires_at TIMESTAMPTZ;
++
++-- V1 also had a status-only CHECK; both constraints must accept HELD.
++ALTER TABLE seats DROP CONSTRAINT ck_seats_status;
++ALTER TABLE seats ADD CONSTRAINT ck_seats_status
++    CHECK (status IN ('AVAILABLE','HELD','RESERVED'));
++ALTER TABLE seats DROP CONSTRAINT ck_seats_reservation_state;
++ALTER TABLE seats ADD CONSTRAINT ck_seats_lifecycle_state CHECK (
++    (status = 'AVAILABLE' AND reservation_id IS NULL AND hold_id IS NULL
++        AND hold_customer_id IS NULL AND hold_expires_at IS NULL)
++ OR (status = 'HELD' AND reservation_id IS NULL AND hold_id IS NOT NULL
++        AND hold_customer_id IS NOT NULL AND hold_expires_at IS NOT NULL)
++ OR (status = 'RESERVED' AND reservation_id IS NOT NULL AND hold_id IS NULL
++        AND hold_customer_id IS NULL AND hold_expires_at IS NULL)
++);
++
++CREATE UNIQUE INDEX uq_seats_hold_id ON seats(hold_id) WHERE hold_id IS NOT NULL;
++CREATE INDEX idx_seats_held_expires_at ON seats(hold_expires_at) WHERE status = 'HELD';
++
++-- Immutable idempotency tombstone: canceled/expired hold IDs cannot be rebound.
++CREATE TABLE seat_hold_requests (
++    hold_id UUID PRIMARY KEY,
++    event_id UUID NOT NULL,
++    seat_id UUID NOT NULL,
++    customer_id UUID NOT NULL,
++    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
++);
+diff --git a/inventory-service/src/main/resources/db/migration/V5__reservation_history.sql b/inventory-service/src/main/resources/db/migration/V5__reservation_history.sql
+new file mode 100644
+index 0000000..558c35f
+--- /dev/null
++++ b/inventory-service/src/main/resources/db/migration/V5__reservation_history.sql
+@@ -0,0 +1,16 @@
++-- Prevent canceled reservations from being resurrected by late retry deliveries.
++CREATE TABLE seat_reservation_history (
++    booking_id UUID PRIMARY KEY,
++    event_id UUID NOT NULL,
++    seat_id UUID NOT NULL,
++    state VARCHAR(16) NOT NULL CHECK(state IN ('ACTIVE', 'CANCELLED')),
++    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
++    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
++);
++
++-- Backfill all previously confirmed seats. No historical data is erased.
++INSERT INTO seat_reservation_history (booking_id, event_id, seat_id, state)
++SELECT reservation_id, event_id, id, 'ACTIVE'
++FROM seats
++WHERE status = 'RESERVED' AND reservation_id IS NOT NULL;
++CREATE INDEX idx_seat_reservation_history_state ON seat_reservation_history(state,updated_at);
+diff --git a/inventory-service/src/test/java/com/seatlock/inventory/application/SeatReservationServiceTest.java b/inventory-service/src/test/java/com/seatlock/inventory/application/SeatReservationServiceTest.java
+index 42c23af..bb7109d 100644
+--- a/inventory-service/src/test/java/com/seatlock/inventory/application/SeatReservationServiceTest.java
++++ b/inventory-service/src/test/java/com/seatlock/inventory/application/SeatReservationServiceTest.java
+@@ -13,7 +13,8 @@ import static org.mockito.Mockito.*;
+ 
+ class SeatReservationServiceTest {
+     private final SeatRepository seats = mock(SeatRepository.class);
+-    private final SeatReservationService service = new SeatReservationService(seats);
++    private final ReservationHistoryStore history = mock(ReservationHistoryStore.class);
++    private final SeatReservationService service = new SeatReservationService(seats, history);
+ 
+     @Test
+     void firstReservationClaimsSeat() {
+diff --git a/inventory-service/src/test/java/com/seatlock/inventory/integration/SeatHoldLifecycleIntegrationTest.java b/inventory-service/src/test/java/com/seatlock/inventory/integration/SeatHoldLifecycleIntegrationTest.java
+new file mode 100644
+index 0000000..eb95e1f
+--- /dev/null
++++ b/inventory-service/src/test/java/com/seatlock/inventory/integration/SeatHoldLifecycleIntegrationTest.java
+@@ -0,0 +1,156 @@
++package com.seatlock.inventory.integration;
++
++import com.seatlock.inventory.application.ReservationConflictException;
++import com.seatlock.inventory.application.SeatHoldConflictException;
++import com.seatlock.inventory.application.SeatHoldNotFoundException;
++import com.seatlock.inventory.application.SeatHoldService;
++import com.seatlock.inventory.application.SeatReservationService;
++import java.util.UUID;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.test.context.DynamicPropertyRegistry;
++import org.springframework.test.context.DynamicPropertySource;
++import org.testcontainers.junit.jupiter.Container;
++import org.testcontainers.junit.jupiter.Testcontainers;
++import org.testcontainers.postgresql.PostgreSQLContainer;
++import static org.assertj.core.api.Assertions.*;
++
++@Testcontainers
++@SpringBootTest(properties = {"spring.flyway.locations=classpath:db/migration", "seatlock.holds.ttl-seconds=60", "seatlock.holds.enabled=false"})
++class SeatHoldLifecycleIntegrationTest {
++    @Container
++    static PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:17-alpine")
++            .withDatabaseName("seatlock_hold_test");
++
++    @DynamicPropertySource
++    static void db(DynamicPropertyRegistry properties) {
++        properties.add("spring.datasource.url", postgres::getJdbcUrl);
++        properties.add("spring.datasource.username", postgres::getUsername);
++        properties.add("spring.datasource.password", postgres::getPassword);
++    }
++
++    @Autowired SeatHoldService holds;
++    @Autowired SeatReservationService reservations;
++    @Autowired JdbcTemplate jdbc;
++    UUID event, seat, alice, bob;
++
++    @BeforeEach
++    void setup() {
++        jdbc.update("DELETE FROM seat_hold_requests");
++        jdbc.update("DELETE FROM seat_reservation_history");
++        jdbc.update("DELETE FROM seats");
++        jdbc.update("DELETE FROM events");
++        event = UUID.randomUUID(); seat = UUID.randomUUID();
++        alice = UUID.randomUUID(); bob = UUID.randomUUID();
++        jdbc.update("INSERT INTO events(id,title,venue,starts_at) VALUES(?,'test','test',now())", event);
++        jdbc.update("INSERT INTO seats(id,event_id,label,status) VALUES(?,?,'A01','AVAILABLE')", seat,event);
++    }
++
++    @Test
++    void activeHoldBlocksOtherCustomerAndCanBeRedeemedByOwner() {
++        UUID hold = UUID.randomUUID(), booking = UUID.randomUUID();
++        var result = holds.create(event, seat, hold, alice);
++        assertThat(result.created()).isTrue();
++        assertThat(result.receipt().status()).isEqualTo("HELD");
++        assertThat(holds.create(event, seat, hold, alice).created()).isFalse();
++
++        assertThatThrownBy(() -> reservations.reserve(event, seat, UUID.randomUUID()))
++                .isInstanceOf(ReservationConflictException.class);
++        assertThatThrownBy(() -> reservations.reserve(event, seat, UUID.randomUUID(), hold, bob))
++                .isInstanceOf(ReservationConflictException.class);
++        assertThat(reservations.reserve(event, seat, booking, hold, alice).created()).isTrue();
++        assertThat(jdbc.queryForObject("SELECT status FROM seats WHERE id=?", String.class, seat))
++                .isEqualTo("RESERVED");
++        assertThat(jdbc.queryForObject("SELECT hold_id FROM seats WHERE id=?", UUID.class, seat))
++                .isNull();
++        // Once CONFIRMED, hold cleanup must NEVER release it.
++        assertThat(holds.expireDue()).isZero();
++        assertThat(jdbc.queryForObject("SELECT status FROM seats WHERE id=?", String.class, seat))
++                .isEqualTo("RESERVED");
++    }
++
++    @Test
++    void expiredHoldCanBeReclaimedAndOldHoldCannotBeReplayed() {
++        UUID hold = UUID.randomUUID();
++        holds.create(event, seat, hold, alice);
++        jdbc.update("UPDATE seats SET hold_expires_at=now()-interval '1 minute' WHERE id=?", seat);
++        assertThat(reservations.reserve(event, seat, UUID.randomUUID()).created()).isTrue();
++        assertThatThrownBy(() -> holds.create(event, seat, hold, alice))
++                .isInstanceOf(SeatHoldConflictException.class);
++    }
++
++    @Test
++    void explicitCancellationIsOwnedAndDoesNotRebindAnOldIdempotencyKey() {
++        UUID hold = UUID.randomUUID();
++        holds.create(event, seat, hold, alice);
++        assertThatThrownBy(() -> holds.cancel(event, seat, hold, bob))
++                .isInstanceOf(SeatHoldNotFoundException.class);
++        holds.cancel(event, seat, hold, alice);
++        assertThat(jdbc.queryForObject("SELECT status FROM seats WHERE id=?", String.class, seat))
++                .isEqualTo("AVAILABLE");
++        assertThatThrownBy(() -> holds.create(event, seat, hold, alice))
++                .isInstanceOf(SeatHoldConflictException.class);
++        assertThat(holds.create(event, seat, UUID.randomUUID(), bob).created()).isTrue();
++    }
++
++    @Test
++    void sweepReleasesOnlyExpiredHolds() {
++        UUID hold = UUID.randomUUID();
++        holds.create(event, seat, hold, alice);
++        assertThat(holds.expireDue()).isZero();
++        jdbc.update("UPDATE seats SET hold_expires_at=now()-interval '1 minute' WHERE id=?", seat);
++        assertThat(holds.expireDue()).isEqualTo(1);
++        assertThat(holds.expireDue()).isZero();
++        assertThat(jdbc.queryForObject("SELECT status FROM seats WHERE id=?", String.class, seat))
++                .isEqualTo("AVAILABLE");
++    }
++
++    @Test
++    void cancelingConfirmedReservationCreatesPermanentTombstone() {
++        UUID original=UUID.randomUUID();
++        assertThat(reservations.reserve(event,seat,original).created()).isTrue();
++        assertThat(jdbc.queryForObject("SELECT state FROM seat_reservation_history WHERE booking_id=?",
++                String.class,original)).isEqualTo("ACTIVE");
++        reservations.release(event,seat,original);
++        reservations.release(event,seat,original); // idempotent
++        assertThat(jdbc.queryForObject("SELECT state FROM seat_reservation_history WHERE booking_id=?",
++                String.class,original)).isEqualTo("CANCELLED");
++        assertThatThrownBy(() -> reservations.reserve(event,seat,original))
++                .isInstanceOf(ReservationConflictException.class);
++        UUID newBooking=UUID.randomUUID();
++        assertThat(reservations.reserve(event,seat,newBooking).created()).isTrue();
++        reservations.release(event,seat,original); // stale release MUST NOT touch new owner's seat
++        assertThat(jdbc.queryForObject("SELECT reservation_id FROM seats WHERE id=?",UUID.class,seat))
++                .isEqualTo(newBooking);
++    }
++
++    @Test
++    void competingHoldsHaveAtMostOneWinner() throws Exception {
++        int concurrent = 20;
++        var pool = Executors.newFixedThreadPool(concurrent);
++        var gate = new CountDownLatch(1);
++        try {
++            var futures = new java.util.ArrayList<java.util.concurrent.Future<Boolean>>();
++            for (int i=0; i<concurrent; i++) {
++                final UUID owner = UUID.randomUUID(), token = UUID.randomUUID();
++                futures.add(pool.submit(() -> {
++                    gate.await();
++                    try { return holds.create(event, seat, token, owner).created(); }
++                    catch (SeatHoldConflictException conflict) { return false; }
++                }));
++            }
++            gate.countDown();
++            int winners=0;
++            for (var future: futures) if (future.get(30,TimeUnit.SECONDS)) winners++;
++            assertThat(winners).isEqualTo(1);
++            assertThat(jdbc.queryForObject("SELECT count(*) FROM seats WHERE id=? AND status='HELD'", Integer.class,seat))
++                    .isEqualTo(1);
++        } finally { gate.countDown(); pool.shutdownNow(); }
++    }
++}
+diff --git a/load/booking-same-seat.js b/load/booking-same-seat.js
+new file mode 100644
+index 0000000..80f9de5
+--- /dev/null
++++ b/load/booking-same-seat.js
+@@ -0,0 +1,29 @@
++// Optional k6 load test. Supply GATEWAY_URL, ACCESS_TOKEN and SEAT_ID.
++// Each VU sends unique idempotency key to test server-side seat contention.
++// Run ONLY with an AVAILABLE seat on a disposable test event; it permanently reserves it.
++import http from 'k6/http';
++import { check, sleep } from 'k6';
++import { Counter } from 'k6/metrics';
++
++export const outcomes = new Counter('seatlock_booking_outcomes');
++export const options = {
++  scenarios: {
++    race: { executor: 'per-vu-iterations', vus: Number(__ENV.VUS || 20), iterations: 1,
++            maxDuration: '60s' },
++  },
++  thresholds: { http_req_failed: ['rate<0.99'] },
++};
++
++export default function () {
++  const base = __ENV.GATEWAY_URL || 'http://localhost:8080';
++  const eventId = __ENV.EVENT_ID || '11111111-1111-4111-8111-111111111111';
++  const seatId = __ENV.SEAT_ID;
++  if (!seatId || !__ENV.ACCESS_TOKEN) throw new Error('Missing SEAT_ID or ACCESS_TOKEN');
++  const response = http.post(`${base}/api/v1/bookings`, JSON.stringify({eventId,seatId}), {
++    headers: {'Content-Type':'application/json','Authorization':`Bearer ${__ENV.ACCESS_TOKEN}`,
++              'Idempotency-Key': `k6-${__VU}-${__ITER}-${Date.now()}`},
++    tags: {scenario:'same-seat'},
++  });
++  outcomes.add(1, {status: String(response.status)});
++  check(response, {'expected conflict or success': r => [201,409].includes(r.status)});
++}
+diff --git a/scripts/part075_cancel_smoke.py b/scripts/part075_cancel_smoke.py
+new file mode 100644
+index 0000000..716f45b
+--- /dev/null
++++ b/scripts/part075_cancel_smoke.py
+@@ -0,0 +1,54 @@
++#!/usr/bin/env python3
++"""Dev-only confirmed-booking cancellation and anti-resurrection HTTP test.
++WARNING: creates bookings and cancels one on demo event; requires >=1 AVAILABLE seat.
++"""
++import os
++import sys
++import time
++import uuid
++from part06_gateway_smoke import GATEWAY, EVENT as DEFAULT_EVENT, request, token, expect
++EVENT = os.getenv("SEATLOCK_EVENT_ID", DEFAULT_EVENT)
++
++def run():
++    alice=token('alice', os.getenv('SEATLOCK_ALICE_PASSWORD','dev_only_alice_password'))
++    bob=token('bob', os.getenv('SEATLOCK_BOB_PASSWORD','dev_only_bob_password'))
++    status,page,_=request(GATEWAY+f'/api/v1/events/{EVENT}/seats?size=50')
++    expect('List demo seats',status,200)
++    seat=next((s['id'] for s in page['content'] if s['status']=='AVAILABLE'),None)
++    if not seat: raise AssertionError('No available demo seat; create a new test event, do not reset database')
++    body={'eventId':EVENT,'seatId':seat}
++    status,booking,_=request(GATEWAY+'/api/v1/bookings','POST',token=alice,payload=body,
++                             headers={'Idempotency-Key':'cancel-'+str(uuid.uuid4())})
++    expect('Alice creates confirmed booking',status,201)
++    assert booking['status']=='CONFIRMED',booking
++    booking_id=booking['id']
++    status,_,_=request(GATEWAY+f'/api/v1/bookings/{booking_id}/cancel','POST',token=bob)
++    expect('Bob forbidden to cancel Alice booking',status,404)
++    status,started,_=request(GATEWAY+f'/api/v1/bookings/{booking_id}/cancel','POST',token=alice)
++    expect('Alice requests cancellation',status,202)
++    assert started['status']=='CANCEL_PENDING',started
++    deadline=time.monotonic()+45
++    while time.monotonic()<deadline:
++        status,current,_=request(GATEWAY+f'/api/v1/bookings/{booking_id}',token=alice)
++        expect('Read cancellation status',status,200)
++        if current['status']=='CANCELLED':break
++        time.sleep(2)
++    else:raise AssertionError('Booking stuck in CANCEL_PENDING; inspect cancellation job / logs')
++    status,_,_=request(GATEWAY+f'/api/v1/bookings/{booking_id}/cancel','POST',token=alice)
++    expect('Idempotent cancellation replay',status,200)
++    status,old,_=request(GATEWAY+f'/api/v1/bookings/{booking_id}/retry','POST',token=alice)
++    expect('Stale retry does not restore canceled booking',status,200)
++    assert old['status']=='CANCELLED',old
++    status,listed,_=request(GATEWAY+f'/api/v1/events/{EVENT}/seats?size=50')
++    expect('Inventory after cancellation',status,200)
++    assert next(x for x in listed['content'] if x['id']==seat)['status']=='AVAILABLE',listed
++    status,new,_=request(GATEWAY+'/api/v1/bookings','POST',token=bob,payload=body,
++                         headers={'Idempotency-Key':'new-owner-'+str(uuid.uuid4())})
++    expect('Bob can book seat after release',status,201)
++    assert new['status']=='CONFIRMED' and new['id']!=booking_id,new
++    print('ALL PART 7.5 CANCELLATION TESTS PASSED: canceled booking cannot resurrect')
++
++if __name__=='__main__':
++    try:run()
++    except (AssertionError,RuntimeError,KeyError,ValueError) as exc:
++        print('FAIL:',exc,file=sys.stderr);sys.exit(1)
+diff --git a/scripts/part075_concurrency.py b/scripts/part075_concurrency.py
+new file mode 100644
+index 0000000..6d5820c
+--- /dev/null
++++ b/scripts/part075_concurrency.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""Real HTTP concurrency lab: different keys, same seat; exactly ONE winner.
++WARNING: permanently consumes ONE AVAILABLE demo seat. Default Gateway profile (Redis rate-limit OFF).
++"""
++import argparse
++import concurrent.futures
++import os
++import sys
++import threading
++import uuid
++from part06_gateway_smoke import GATEWAY,EVENT as DEFAULT_EVENT,request,token
++EVENT = os.getenv("SEATLOCK_EVENT_ID", DEFAULT_EVENT)
++
++
++def run(n):
++    access=token('alice',os.getenv('SEATLOCK_ALICE_PASSWORD','dev_only_alice_password'))
++    status, seats,_=request(GATEWAY+f'/api/v1/events/{EVENT}/seats?size=50')
++    if status!=200: raise AssertionError(f'Seats list returned {status}')
++    seat=next((x['id'] for x in seats['content'] if x['status']=='AVAILABLE'),None)
++    if not seat: raise RuntimeError('No available seat; do not reset DB for a test')
++    gate=threading.Barrier(n)
++    def try_booking(i):
++        gate.wait(timeout=15)
++        return request(GATEWAY+'/api/v1/bookings','POST',token=access,
++                       payload={'eventId':EVENT,'seatId':seat},
++                       headers={'Idempotency-Key':f'load-{uuid.uuid4()}'})[:2]
++    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
++        futures=[executor.submit(try_booking,i) for i in range(n)]
++        responses=[f.result(timeout=45) for f in futures]
++    from collections import Counter
++    counts=Counter(code for code,_ in responses)
++    print('Seat:',seat, 'HTTP statuses:',dict(counts))
++    winners=[body for code,body in responses if code==201 and body.get('status')=='CONFIRMED']
++    if len(winners)!=1: raise AssertionError(f'Exactly 1 winner required; got {len(winners)}. Inspect: {counts}')
++    if counts.get(409)!=n-1:
++        raise AssertionError(f'Expected {n-1} HTTP 409 conflicts, got {counts}. Disable Redis rate limit for lab.')
++    status,listed,_=request(GATEWAY+f'/api/v1/events/{EVENT}/seats?size=50')
++    actual=next(x for x in listed['content'] if x['id']==seat)
++    assert actual['status']=='RESERVED', actual
++    print('PASS: 1 CONFIRMED and',n-1,'conflicts; no double booking')
++
++if __name__=='__main__':
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--clients',type=int,default=20)
++    args=parser.parse_args()
++    if args.clients<2 or args.clients>50:parser.error('clients must be 2..50')
++    try:run(args.clients)
++    except (AssertionError,RuntimeError,TimeoutError,KeyError,ValueError) as exc:
++        print('FAIL:',exc,file=sys.stderr);sys.exit(1)
+diff --git a/scripts/part075_holds_smoke.py b/scripts/part075_holds_smoke.py
+new file mode 100644
+index 0000000..b9917c0
+--- /dev/null
++++ b/scripts/part075_holds_smoke.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++"""Real HTTP smoke: hold, idempotent replay, RBAC, owner-only redemption, cancellation.
++Side effects: permanently reserves ONE demo seat. Uses demo password-grant ONLY for tests.
++"""
++import sys
++import uuid
++import os
++from part06_gateway_smoke import GATEWAY, EVENT as DEFAULT_EVENT, request, token, expect
++EVENT = os.getenv("SEATLOCK_EVENT_ID", DEFAULT_EVENT)
++
++
++def free_seat():
++    status, page, _ = request(GATEWAY+f'/api/v1/events/{EVENT}/seats?size=50')
++    expect('List seats', status, 200)
++    return next((s['id'] for s in page['content'] if s['status']=='AVAILABLE'), None)
++
++
++def run():
++    alice = token('alice',os.getenv('SEATLOCK_ALICE_PASSWORD','dev_only_alice_password'))
++    bob = token('bob',os.getenv('SEATLOCK_BOB_PASSWORD','dev_only_bob_password'))
++    seat = free_seat()
++    if not seat: raise AssertionError('No available seat. Do not delete data; seed a NEW test event.')
++    body={'eventId': EVENT,'seatId':seat}
++    key='hold-'+str(uuid.uuid4())
++    headers={'Idempotency-Key':key}
++    status, hold,_ = request(GATEWAY+'/api/v1/holds','POST',token=alice,payload=body,headers=headers)
++    expect('Alice creates a hold',status,201)
++    assert hold['status']=='HELD' and hold['seatId']==seat,hold
++    hold_id=hold['holdId']
++    status, replay,_=request(GATEWAY+'/api/v1/holds','POST',token=alice,payload=body,headers=headers)
++    expect('Idempotent hold replay',status,200)
++    assert replay['holdId']==hold_id
++
++    status,_,_=request(GATEWAY+'/api/v1/bookings','POST',token=bob,payload={**body,'holdId':hold_id},
++                       headers={'Idempotency-Key':'bob-'+str(uuid.uuid4())})
++    expect('Bob cannot steal Alice hold',status,409)
++    status,_,_=request(GATEWAY+'/api/v1/bookings','POST',token=bob,payload=body,
++                       headers={'Idempotency-Key':'bob-'+str(uuid.uuid4())})
++    expect('Bob cannot bypass active hold',status,409)
++    status,book,_=request(GATEWAY+'/api/v1/bookings','POST',token=alice,
++                          payload={**body,'holdId':hold_id},
++                          headers={'Idempotency-Key':'book-'+str(uuid.uuid4())})
++    expect('Alice redeems her hold',status,201)
++    assert book['status']=='CONFIRMED' and book['holdId']==hold_id,book
++    print('PASS: CONFIRMED seat will NOT expire with temporary holds')
++
++    seat2=free_seat()
++    if seat2:
++        body2={'eventId':EVENT,'seatId':seat2}
++        key2='hold-'+str(uuid.uuid4())
++        status,held,_=request(GATEWAY+'/api/v1/holds','POST',token=alice,
++                              payload=body2,headers={'Idempotency-Key':key2})
++        expect('Create cancelable hold',status,201)
++        status,_,_=request(GATEWAY+f"/api/v1/holds/{held['holdId']}?eventId={EVENT}&seatId={seat2}",
++                           'DELETE',token=bob)
++        expect('Bob cannot cancel Alice hold',status,409)
++        status,_,_=request(GATEWAY+f"/api/v1/holds/{held['holdId']}?eventId={EVENT}&seatId={seat2}",
++                           'DELETE',token=alice)
++        expect('Alice cancels hold',status,204)
++        status,_,_=request(GATEWAY+'/api/v1/holds','POST',token=alice,
++                           payload=body2,headers={'Idempotency-Key':key2})
++        expect('Canceled hold id cannot be reused',status,409)
++    else:
++        print('SKIP cancellation smoke: no second free seat (integrations cover it)')
++    print('ALL PART 7.5 HOLD SMOKE TESTS PASSED')
++
++if __name__=='__main__':
++    try: run()
++    except (AssertionError,RuntimeError,KeyError,ValueError) as exc:
++        print('FAIL:',exc,file=sys.stderr);sys.exit(1)
+diff --git a/scripts/part075_seed_event.sh b/scripts/part075_seed_event.sh
+new file mode 100755
+index 0000000..c94cf5b
+--- /dev/null
++++ b/scripts/part075_seed_event.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++# ONLY ADDITIVE seed. Uses a NEW event UUID and 20 NEW seats, never deletes existing data.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++EVENT_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
++docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d inventory_db' <<SQL
++BEGIN;
++INSERT INTO events(id,title,venue,starts_at)
++VALUES ('$EVENT_ID','SeatLock Concurrency Lab','Test Venue',now()+interval '30 days');
++INSERT INTO seats(id,event_id,label,status)
++SELECT gen_random_uuid(),'$EVENT_ID','A'||lpad(n::text,2,'0'),'AVAILABLE'
++FROM generate_series(1,20) AS s(n);
++COMMIT;
++SQL
++printf '\nCreated isolated test event (20 AVAILABLE seats).\n'
++printf 'Run: export SEATLOCK_EVENT_ID=%s\n' "$EVENT_ID"

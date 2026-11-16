@@ -1,0 +1,9 @@
+# LOCAL LINUX ONLY: host network required because Boot binds 127.0.0.1.
+# Do not use this as a production deployment pattern.
+services:
+  booking-load-balancer:
+    image: nginx:stable-alpine
+    network_mode: host
+    volumes:
+      - ./infra/nginx/seatlock-booking.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped

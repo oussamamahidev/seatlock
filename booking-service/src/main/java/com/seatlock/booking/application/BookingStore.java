@@ -16,11 +16,14 @@ public class BookingStore {
     private final BookingRepository bookings;
     private final RecoveryJobStore jobs;
     private final RetryBackoff backoff;
+    private final CancellationJobStore cancellations;
 
-    public BookingStore(BookingRepository bookings, RecoveryJobStore jobs, RetryBackoff backoff) {
+    public BookingStore(BookingRepository bookings, RecoveryJobStore jobs,
+                        RetryBackoff backoff, CancellationJobStore cancellations) {
         this.bookings = bookings;
         this.jobs = jobs;
         this.backoff = backoff;
+        this.cancellations = cancellations;
     }
 
     @Transactional(readOnly = true)
@@ -45,8 +48,14 @@ public class BookingStore {
     @Transactional
     public BookingView insert(UUID customerId, String key,
                               UUID eventId, UUID seatId, String fingerprint) {
+        return insert(customerId, key, eventId, seatId, fingerprint, null);
+    }
+
+    @Transactional
+    public BookingView insert(UUID customerId, String key,
+                              UUID eventId, UUID seatId, String fingerprint, UUID holdId) {
         BookingEntity booking = new BookingEntity(
-                UUID.randomUUID(), customerId, eventId, seatId, key, fingerprint);
+                UUID.randomUUID(), customerId, eventId, seatId, key, fingerprint, holdId);
         BookingView result = BookingView.from(bookings.saveAndFlush(booking));
         // Same transaction: a crash cannot leave a booking with no recovery job.
         jobs.create(result.id());
@@ -60,6 +69,46 @@ public class BookingStore {
         booking.transition(status, reason);
         if (booking.getStatus().isTerminal()) jobs.markDone(bookingId);
         else if (status == BookingStatus.UNCERTAIN) jobs.activateAfterUnknown(bookingId);
+        return BookingView.from(booking);
+    }
+
+    /** ACID: CANCEL_PENDING booking and its cancellation job commit together. */
+    @Transactional
+    public BookingView beginCancellation(UUID customerId, UUID bookingId) {
+        BookingEntity booking = bookings.lockById(bookingId)
+                .orElseThrow(BookingNotFoundException::new);
+        if (!booking.getCustomerId().equals(customerId)) throw new BookingNotFoundException();
+        if (booking.getStatus() == BookingStatus.CONFIRMED) {
+            booking.startCancellation();
+            cancellations.create(bookingId);
+        } else if (booking.getStatus() != BookingStatus.CANCEL_PENDING
+                && booking.getStatus() != BookingStatus.CANCELLED) {
+            throw new BookingCancellationConflictException(
+                    "Only CONFIRMED bookings may be canceled");
+        }
+        return BookingView.from(booking);
+    }
+
+    /** Fenced worker settlement: no stale worker may mark a booking canceled. */
+    @Transactional
+    public BookingView settleCancellation(CancellationLease lease, boolean released, int maxAttempts) {
+        BookingEntity booking = bookings.lockById(lease.bookingId())
+                .orElseThrow(BookingNotFoundException::new);
+        if (!cancellations.ownsLease(lease)) return BookingView.from(booking);
+        if (booking.getStatus() == BookingStatus.CANCEL_PENDING) {
+            if (released) {
+                booking.completeCancellation();
+                cancellations.finish(lease);
+            } else {
+                boolean exhausted = lease.attempt() >= maxAttempts;
+                cancellations.postpone(lease, Instant.now().plus(
+                        backoff.delay(lease.bookingId(), lease.attempt())), exhausted);
+            }
+        } else if (booking.getStatus() == BookingStatus.CANCELLED) {
+            cancellations.finish(lease);
+        } else {
+            throw new IllegalStateException("Cancellation job attached to non-cancelable booking");
+        }
         return BookingView.from(booking);
     }
 

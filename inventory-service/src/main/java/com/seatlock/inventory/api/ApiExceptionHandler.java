@@ -3,6 +3,8 @@ package com.seatlock.inventory.api;
 import com.seatlock.inventory.application.EventNotFoundException;
 import com.seatlock.inventory.application.InvalidPageException;
 import com.seatlock.inventory.application.ReservationConflictException;
+import com.seatlock.inventory.application.SeatHoldConflictException;
+import com.seatlock.inventory.application.SeatHoldNotFoundException;
 import com.seatlock.inventory.application.SeatNotFoundException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.http.HttpStatus;
@@ -31,6 +33,21 @@ public class ApiExceptionHandler {
     @ExceptionHandler(ReservationConflictException.class)
     public ResponseEntity<ProblemDetail> conflict(ReservationConflictException ex) {
         return problem(HttpStatus.CONFLICT, "Reservation conflict", ex.getMessage());
+    }
+
+    @ExceptionHandler(SeatHoldConflictException.class)
+    public ResponseEntity<ProblemDetail> holdConflict(SeatHoldConflictException ex) {
+        return problem(HttpStatus.CONFLICT, "Seat hold conflict", ex.getMessage());
+    }
+
+    @ExceptionHandler(SeatHoldNotFoundException.class)
+    public ResponseEntity<ProblemDetail> holdNotFound(SeatHoldNotFoundException ex) {
+        return problem(HttpStatus.NOT_FOUND, "Seat hold not found", ex.getMessage());
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<ProblemDetail> invalidHold(IllegalArgumentException ex) {
+        return problem(HttpStatus.BAD_REQUEST, "Invalid seat hold request", ex.getMessage());
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

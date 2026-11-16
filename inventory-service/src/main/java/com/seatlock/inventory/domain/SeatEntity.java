@@ -34,6 +34,15 @@ public class SeatEntity {
     @Column(name = "reservation_id")
     private UUID reservationId;
 
+    @Column(name = "hold_id")
+    private UUID holdId;
+
+    @Column(name = "hold_customer_id")
+    private UUID holdCustomerId;
+
+    @Column(name = "hold_expires_at")
+    private java.time.Instant holdExpiresAt;
+
     protected SeatEntity() {
         // Required by JPA.
     }
@@ -50,4 +59,7 @@ public class SeatEntity {
     public String getLabel() { return label; }
     public SeatStatus getStatus() { return status; }
     public UUID getReservationId() { return reservationId; }
+    public UUID getHoldId() { return holdId; }
+    public UUID getHoldCustomerId() { return holdCustomerId; }
+    public java.time.Instant getHoldExpiresAt() { return holdExpiresAt; }
 }

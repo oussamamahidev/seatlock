@@ -73,12 +73,12 @@ public class RecoveryJobStore {
             maxBatch, token, leaseSeconds);
     }
 
-    /** Prevents a worker whose lease expired from committing a stale response. */
+    /** Use wall time: PostgreSQL now() stays frozen while a transaction waits for locks. */
     public boolean ownsLease(RecoveryLease lease) {
         Integer count = jdbc.queryForObject("""
             SELECT count(*) FROM booking_recovery_jobs
             WHERE booking_id = ? AND state = 'LEASED'
-              AND owner_token = ? AND lease_until > now()
+              AND owner_token = ? AND lease_until > clock_timestamp()
             """, Integer.class, lease.bookingId(), lease.token());
         return count != null && count == 1;
     }
@@ -89,7 +89,7 @@ public class RecoveryJobStore {
             SET state = 'DONE', owner_token = NULL, lease_until = NULL,
                 last_error = NULL, updated_at = now()
             WHERE booking_id = ? AND state = 'LEASED' AND owner_token = ?
-              AND lease_until > now()
+              AND lease_until > clock_timestamp()
             """, lease.bookingId(), lease.token());
         if (rows != 1) throw new IllegalStateException("Recovery lease was lost");
     }
@@ -101,7 +101,7 @@ public class RecoveryJobStore {
             SET state = ?, next_attempt_at = ?, owner_token = NULL,
                 lease_until = NULL, last_error = ?, updated_at = now()
             WHERE booking_id = ? AND state = 'LEASED' AND owner_token = ?
-              AND lease_until > now()
+              AND lease_until > clock_timestamp()
             """, state, Timestamp.from(next), reason, lease.bookingId(), lease.token());
         if (rows != 1) throw new IllegalStateException("Recovery lease was lost");
     }

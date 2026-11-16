@@ -52,3 +52,8 @@ seatlock:
     batch-size: 5
     lease-seconds: 90
     max-attempts: 12
+  cancellation:
+    enabled: ${CANCELLATION_ENABLED:true}
+    initial-delay-ms: 3000
+    poll-ms: 2000
+    max-attempts: 12

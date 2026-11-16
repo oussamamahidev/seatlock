@@ -1,6 +1,10 @@
 /home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/application/BookingRecoveryWorkerTest.java
 /home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/application/BookingWorkflowTest.java
+/home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/application/HoldWorkflowTest.java
 /home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/application/RetryBackoffTest.java
+/home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/domain/BookingCancellationStateTest.java
+/home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/integration/BookingCancellationIntegrationTest.java
 /home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/integration/BookingPersistenceTest.java
 /home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/integration/BookingRecoveryJobIntegrationTest.java
+/home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/integration/BookingRecoverySchedulerIntegrationTest.java
 /home/oussama/Desktop/seatlock/booking-service/src/test/java/com/seatlock/booking/security/RealmRolesConverterTest.java

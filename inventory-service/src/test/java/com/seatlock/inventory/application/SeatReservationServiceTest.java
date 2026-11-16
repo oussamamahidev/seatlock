@@ -13,7 +13,8 @@ import static org.mockito.Mockito.*;
 
 class SeatReservationServiceTest {
     private final SeatRepository seats = mock(SeatRepository.class);
-    private final SeatReservationService service = new SeatReservationService(seats);
+    private final ReservationHistoryStore history = mock(ReservationHistoryStore.class);
+    private final SeatReservationService service = new SeatReservationService(seats, history);
 
     @Test
     void firstReservationClaimsSeat() {

@@ -35,6 +35,9 @@ public class BookingEntity {
     @Column(nullable = false, length = 16)
     private BookingStatus status;
 
+    @Column(name = "hold_id")
+    private UUID holdId;
+
     @Column(name = "failure_reason", length = 256)
     private String failureReason;
 
@@ -52,6 +55,12 @@ public class BookingEntity {
 
     public BookingEntity(UUID id, UUID customerId, UUID eventId, UUID seatId,
                          String idempotencyKey, String requestFingerprint) {
+        this(id, customerId, eventId, seatId, idempotencyKey, requestFingerprint, null);
+    }
+
+    public BookingEntity(UUID id, UUID customerId, UUID eventId, UUID seatId,
+                         String idempotencyKey, String requestFingerprint, UUID holdId) {
+        this.holdId = holdId;
         this.id = id;
         this.customerId = customerId;
         this.eventId = eventId;
@@ -64,12 +73,30 @@ public class BookingEntity {
     }
 
     public void transition(BookingStatus next, String reason) {
-        if (this.status.isTerminal()) {
+        if (this.status.isTerminal() || this.status == BookingStatus.CANCEL_PENDING) {
             return; // A delayed response cannot overwrite a committed decision.
         }
         this.status = next;
         this.failureReason = reason;
         this.updatedAt = Instant.now();
+    }
+
+    /** Cancellation is a separate Saga, not a normal reservation transition. */
+    public void startCancellation() {
+        if (status != BookingStatus.CONFIRMED) {
+            throw new IllegalStateException("Only confirmed bookings can start cancellation");
+        }
+        status = BookingStatus.CANCEL_PENDING;
+        updatedAt = Instant.now();
+    }
+
+    public void completeCancellation() {
+        if (status != BookingStatus.CANCEL_PENDING) {
+            throw new IllegalStateException("Booking is not awaiting cancellation");
+        }
+        status = BookingStatus.CANCELLED;
+        failureReason = null;
+        updatedAt = Instant.now();
     }
 
     public UUID getId() { return id; }
@@ -80,6 +107,7 @@ public class BookingEntity {
     public String getRequestFingerprint() { return requestFingerprint; }
     public BookingStatus getStatus() { return status; }
     public String getFailureReason() { return failureReason; }
+    public UUID getHoldId() { return holdId; }
     public Instant getCreatedAt() { return createdAt; }
     public Instant getUpdatedAt() { return updatedAt; }
 }

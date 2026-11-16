@@ -2,6 +2,9 @@ package com.seatlock.booking.api;
 
 import com.seatlock.booking.application.BookingNotFoundException;
 import com.seatlock.booking.application.IdempotencyMismatchException;
+import com.seatlock.booking.application.BookingCancellationConflictException;
+import com.seatlock.booking.application.HoldConflictException;
+import com.seatlock.booking.application.HoldUnavailableException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
@@ -21,6 +24,21 @@ public class BookingExceptionHandler {
     @ExceptionHandler(IdempotencyMismatchException.class)
     ResponseEntity<ProblemDetail> keyConflict(IdempotencyMismatchException ex) {
         return problem(HttpStatus.CONFLICT, "Idempotency conflict", ex.getMessage());
+    }
+
+    @ExceptionHandler(BookingCancellationConflictException.class)
+    ResponseEntity<ProblemDetail> cancelConflict(BookingCancellationConflictException ex) {
+        return problem(HttpStatus.CONFLICT, "Cancellation conflict", ex.getMessage());
+    }
+
+    @ExceptionHandler(HoldConflictException.class)
+    ResponseEntity<ProblemDetail> holdConflict(HoldConflictException ex) {
+        return problem(HttpStatus.CONFLICT, "Hold conflict", ex.getMessage());
+    }
+
+    @ExceptionHandler(HoldUnavailableException.class)
+    ResponseEntity<ProblemDetail> holdUnavailable(HoldUnavailableException ex) {
+        return problem(HttpStatus.SERVICE_UNAVAILABLE, "Inventory temporarily unavailable", ex.getMessage());
     }
 
     @ExceptionHandler({IllegalArgumentException.class, MethodArgumentNotValidException.class,

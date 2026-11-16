@@ -23,7 +23,12 @@ public class GatewaySecurityConfig {
                 .pathMatchers(HttpMethod.OPTIONS, "/**").permitAll()
                 .pathMatchers("/actuator/health", "/actuator/health/**").permitAll()
                 .pathMatchers(HttpMethod.GET, "/api/v1/events", "/api/v1/events/*/seats").permitAll()
-                .pathMatchers(HttpMethod.POST, "/api/v1/bookings", "/api/v1/bookings/*/retry")
+                .pathMatchers(HttpMethod.POST, "/api/v1/holds")
+                    .hasAuthority("ROLE_customer")
+                .pathMatchers(HttpMethod.DELETE, "/api/v1/holds/*")
+                    .hasAuthority("ROLE_customer")
+                .pathMatchers(HttpMethod.POST, "/api/v1/bookings", "/api/v1/bookings/*/retry",
+                        "/api/v1/bookings/*/cancel")
                     .hasAuthority("ROLE_customer")
                 .pathMatchers(HttpMethod.GET, "/api/v1/bookings/*")
                     .hasAuthority("ROLE_customer")

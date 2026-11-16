@@ -33,3 +33,9 @@ management:
       exposure:
         include: health,info
 
+
+seatlock:
+  holds:
+    enabled: ${SEAT_HOLD_EXPIRY_ENABLED:true}
+    ttl-seconds: ${SEAT_HOLD_TTL_SECONDS:120}
+    sweep-ms: ${SEAT_HOLD_SWEEP_MS:2000}

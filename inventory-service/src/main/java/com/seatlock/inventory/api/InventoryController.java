@@ -6,6 +6,8 @@ import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import com.seatlock.inventory.application.SeatHoldService;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -20,11 +22,13 @@ import java.util.UUID;
 public class InventoryController {
     private final InventoryQueryService service;
     private final SeatReservationService reservations;
+    private final SeatHoldService holds;
 
     public InventoryController(InventoryQueryService service,
-                               SeatReservationService reservations) {
+                               SeatReservationService reservations, SeatHoldService holds) {
         this.service = service;
         this.reservations = reservations;
+        this.holds = holds;
     }
 
     @GetMapping
@@ -39,11 +43,34 @@ public class InventoryController {
             @PathVariable UUID eventId,
             @PathVariable UUID seatId,
             @Valid @RequestBody ReserveSeatRequest request) {
-        var result = reservations.reserve(eventId, seatId, request.bookingId());
+        var result = reservations.reserve(eventId, seatId, request.bookingId(),
+                request.holdId(), request.customerId());
         var response = new ReservationView(
                 result.eventId(), result.seatId(), result.bookingId(), "RESERVED");
         return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK)
                 .body(response);
+    }
+
+    @DeleteMapping("/{eventId}/seats/{seatId}/reservations/{bookingId}")
+    public ResponseEntity<Void> cancelReservation(@PathVariable UUID eventId,
+            @PathVariable UUID seatId, @PathVariable UUID bookingId) {
+        reservations.release(eventId, seatId, bookingId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/{eventId}/seats/{seatId}/holds")
+    public ResponseEntity<SeatHoldView> hold(@PathVariable UUID eventId,
+             @PathVariable UUID seatId, @Valid @RequestBody HoldSeatRequest request) {
+        var outcome = holds.create(eventId, seatId, request.holdId(), request.customerId());
+        return ResponseEntity.status(outcome.created() ? HttpStatus.CREATED : HttpStatus.OK)
+                .body(outcome.receipt());
+    }
+
+    @DeleteMapping("/{eventId}/seats/{seatId}/holds/{holdId}")
+    public ResponseEntity<Void> cancelHold(@PathVariable UUID eventId, @PathVariable UUID seatId,
+             @PathVariable UUID holdId, @RequestParam UUID customerId) {
+        holds.cancel(eventId, seatId, holdId, customerId);
+        return ResponseEntity.noContent().build();
     }
 
     @GetMapping("/{eventId}/seats")

@@ -1,0 +1,24 @@
+{
+  "timestamp_utc": "2026-11-16T18:16:34.957071+00:00",
+  "event_id": "959dd082-de95-4f29-a58c-57b6880035ce",
+  "seat_id": "9999e052-9c74-41b1-b97d-01ab1dc62ecd",
+  "target": "http://127.0.0.1:8080",
+  "clients": 100,
+  "status_counts": {
+    "201": 1,
+    "409": 99
+  },
+  "confirmed_winners": 1,
+  "elapsed_seconds": 0.914,
+  "requests_per_second": 109.45,
+  "latency_ms": {
+    "min": 439.81,
+    "p50": 662.0,
+    "p95": 889.23,
+    "p99": 892.57,
+    "max": 893.85
+  },
+  "errors": [],
+  "inventory_seat_status": "RESERVED",
+  "passed": true
+}

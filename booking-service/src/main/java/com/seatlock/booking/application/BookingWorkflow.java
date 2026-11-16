@@ -6,6 +6,10 @@ import com.seatlock.booking.domain.BookingStatus;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import java.util.UUID;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.regex.Pattern;
 
 /** Orchestrates independent local transactions and an idempotent remote call. */
@@ -34,8 +38,10 @@ public class BookingWorkflow {
 
         final BookingView pending;
         try {
-            pending = store.insert(customerId, key,
-                    request.eventId(), request.seatId(), fingerprint);
+            pending = request.holdId() == null
+                    ? store.insert(customerId, key, request.eventId(), request.seatId(), fingerprint)
+                    : store.insert(customerId, key, request.eventId(), request.seatId(), fingerprint,
+                            request.holdId());
         } catch (DataIntegrityViolationException duplicate) {
             // The other concurrent INSERT committed its unique key first.
             BookingView winner = store.byCustomerAndKey(customerId, key)
@@ -46,13 +52,18 @@ public class BookingWorkflow {
         return new Outcome(attempt(pending), true);
     }
 
+    public BookingView cancel(UUID customerId, UUID id) {
+        return store.beginCancellation(customerId, id);
+    }
+
     public BookingView get(UUID customerId, UUID id) {
         return store.ownedBooking(customerId, id);
     }
 
     public BookingView retry(UUID customerId, UUID id) {
         BookingView current = store.ownedBooking(customerId, id);
-        if (current.status().isTerminal()) {
+        if (current.status().isTerminal()
+                || current.status() == BookingStatus.CANCEL_PENDING) {
             return current;
         }
         // Same bookingId => Inventory's existing idempotency guard applies.
@@ -66,14 +77,24 @@ public class BookingWorkflow {
 
     private static String fingerprint(CreateBookingRequest request) {
         // Stable and unambiguous for the two UUID fields in this MVP.
-        return request.eventId() + ":" + request.seatId();
+        return fingerprint(request.eventId(), request.seatId(), request.holdId());
+    }
+
+    private static String fingerprint(UUID eventId, UUID seatId, UUID holdId) {
+        if (holdId == null) return eventId + ":" + seatId; // Backward compatible fingerprint
+        try {
+            byte[] bytes = MessageDigest.getInstance("SHA-256").digest(
+                    ("hold-v1:" + eventId + ":" + seatId + ":" + holdId)
+                        .getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(bytes);
+        } catch (NoSuchAlgorithmException ex) {
+            throw new IllegalStateException("SHA-256 is unavailable", ex);
+        }
     }
 
     private static void requireSameRequest(BookingView existing, String fingerprint) {
-        String recorded = existing.eventId() + ":" + existing.seatId();
-        if (!recorded.equals(fingerprint)) {
-            throw new IdempotencyMismatchException();
-        }
+        String recorded = fingerprint(existing.eventId(), existing.seatId(), existing.holdId());
+        if (!recorded.equals(fingerprint)) throw new IdempotencyMismatchException();
     }
 
     public record Outcome(BookingView booking, boolean created) { }

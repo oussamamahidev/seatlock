@@ -1,5 +1,10 @@
+com/seatlock/booking/application/HoldWorkflowTest.class
 com/seatlock/booking/application/BookingRecoveryWorkerTest.class
+com/seatlock/booking/domain/BookingCancellationStateTest.class
+com/seatlock/booking/integration/BookingCancellationIntegrationTest$ConfirmedBooking.class
+com/seatlock/booking/integration/BookingCancellationIntegrationTest.class
 com/seatlock/booking/application/RetryBackoffTest.class
+com/seatlock/booking/integration/BookingRecoverySchedulerIntegrationTest.class
 com/seatlock/booking/integration/BookingPersistenceTest.class
 com/seatlock/booking/integration/BookingRecoveryJobIntegrationTest.class
 com/seatlock/booking/application/BookingWorkflowTest.class

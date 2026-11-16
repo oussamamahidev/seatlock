@@ -19,6 +19,56 @@ class BookingRecoveryWorkerTest {
     @Mock BookingStore store;
     @Mock InventoryPort inventory;
 
+    @Test void idleWorkerPublishesZeroCountersAndRecordsEmptyPoll() {
+        var registry = new SimpleMeterRegistry();
+        var worker = new BookingRecoveryWorker(jobs, store, inventory, registry, 5, 90, 12);
+        assertThat(registry.get("seatlock.recovery.polls").counter().count()).isZero();
+        when(jobs.claim(5, 90)).thenReturn(List.of());
+
+        worker.poll();
+
+        assertThat(registry.get("seatlock.recovery.polls").counter().count()).isEqualTo(1);
+        assertThat(registry.get("seatlock.recovery.claimed").counter().count()).isZero();
+        assertThat(registry.get("seatlock.recovery.duration").timer().count()).isZero();
+        verifyNoInteractions(store, inventory);
+    }
+
+    @Test void claimFailureIsObservableAndNextPollCanRetry() {
+        var registry = new SimpleMeterRegistry();
+        var worker = new BookingRecoveryWorker(jobs, store, inventory, registry, 5, 90, 12);
+        when(jobs.claim(5, 90)).thenThrow(new IllegalStateException("database unavailable"))
+                .thenReturn(List.of());
+
+        worker.poll();
+        worker.poll();
+
+        assertThat(registry.get("seatlock.recovery.claim.errors").counter().count()).isEqualTo(1);
+        assertThat(registry.get("seatlock.recovery.polls").counter().count()).isEqualTo(2);
+        verifyNoInteractions(store, inventory);
+    }
+
+    @Test void oneProcessingFailureDoesNotStopTheRestOfTheClaimedBatch() {
+        var failed = new RecoveryLease(UUID.randomUUID(), UUID.randomUUID(), 1);
+        var finished = new RecoveryLease(UUID.randomUUID(), UUID.randomUUID(), 2);
+        var terminal = booking(finished.bookingId(), BookingStatus.CONFIRMED);
+        var registry = new SimpleMeterRegistry();
+        var worker = new BookingRecoveryWorker(jobs, store, inventory, registry, 5, 90, 12);
+        when(jobs.claim(5, 90)).thenReturn(List.of(failed, finished));
+        when(store.internalBooking(failed.bookingId())).thenThrow(new IllegalStateException("database unavailable"));
+        when(store.internalBooking(finished.bookingId())).thenReturn(terminal);
+        when(store.settleRecovery(eq(finished), any(), eq(12))).thenReturn(terminal);
+
+        worker.poll();
+
+        assertThat(registry.get("seatlock.recovery.errors").counter().count()).isEqualTo(1);
+        assertThat(registry.get("seatlock.recovery.claimed").counter().count()).isEqualTo(2);
+        assertThat(registry.get("seatlock.recovery.duration").timer().count()).isEqualTo(2);
+        assertThat(registry.get("seatlock.recovery.outcomes").tag("status", "CONFIRMED")
+                .counter().count()).isEqualTo(1);
+        verify(store, never()).settleRecovery(eq(failed), any(), anyInt());
+        verifyNoInteractions(inventory);
+    }
+
     @Test void unknownJobRetriedWithSameBookingIdAndObserved() {
         var id = UUID.randomUUID();
         var lease = new RecoveryLease(id, UUID.randomUUID(), 1);

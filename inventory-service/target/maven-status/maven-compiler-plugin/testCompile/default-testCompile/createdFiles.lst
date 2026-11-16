@@ -1,3 +1,4 @@
+com/seatlock/inventory/integration/SeatHoldLifecycleIntegrationTest.class
+com/seatlock/inventory/application/SeatReservationServiceTest.class
 com/seatlock/inventory/integration/SeatReservationConcurrencyTest.class
 com/seatlock/inventory/security/RealmRolesConverterTest.class
-com/seatlock/inventory/application/SeatReservationServiceTest.class

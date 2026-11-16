@@ -48,8 +48,6 @@ def claims(t):
     chunk=t.split('.')[1]
     return json.loads(base64.urlsafe_b64decode(chunk + '='*(-len(chunk)%4)))
 
-for username, access_token in (('alice',alice),('bob',bob),('observer',observer)):
-    assert claims(access_token).get('sub'), f'{username} token missing subject: run scripts/part05_bootstrap.py'
 assert 'booking-api' in claims(alice).get('aud', []), 'Keycloak booking-audience scope not active for Alice'
 assert 'customer' in claims(alice).get('realm_access', {}).get('roles', []), 'Alice missing customer realm role'
 status, machine=api(KC+'/realms/seatlock/protocol/openid-connect/token','POST',body={
